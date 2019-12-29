@@ -162,9 +162,7 @@ fault_page_release(vm_page_t *mp)
 		 * this page.  Deactivating it leaves it available for
 		 * pageout while optimizing fault restarts.
 		 */
-		vm_page_lock(m);
 		vm_page_deactivate(m);
-		vm_page_unlock(m);
 		vm_page_xunbusy(m);
 		*mp = NULL;
 	}
@@ -395,9 +393,7 @@ vm_fault_populate_cleanup(vm_object_t object, vm_pindex_t first,
 	for (pidx = first, m = vm_page_lookup(object, pidx);
 	    pidx <= last; pidx++, m = vm_page_next(m)) {
 		vm_fault_populate_check_page(m);
-		vm_page_lock(m);
 		vm_page_deactivate(m);
-		vm_page_unlock(m);
 		vm_page_xunbusy(m);
 	}
 }
@@ -406,7 +402,6 @@ static int
 vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
     int fault_flags, boolean_t wired, vm_page_t *m_hold)
 {
-	struct mtx *m_mtx;
 	vm_offset_t vaddr;
 	vm_page_t m;
 	vm_pindex_t map_first, map_last, pager_first, pager_last, pidx;
@@ -518,22 +513,17 @@ vm_fault_populate(struct faultstate *fs, vm_prot_t prot, int fault_type,
 		MPASS(rv == KERN_SUCCESS);
 #endif
 		VM_OBJECT_WLOCK(fs->first_object);
-		m_mtx = NULL;
 		for (i = 0; i < npages; i++) {
-			if ((fault_flags & VM_FAULT_WIRE) != 0) {
+			if ((fault_flags & VM_FAULT_WIRE) != 0)
 				vm_page_wire(&m[i]);
-			} else {
-				vm_page_change_lock(&m[i], &m_mtx);
+			else
 				vm_page_activate(&m[i]);
-			}
 			if (m_hold != NULL && m[i].pindex == fs->first_pindex) {
 				*m_hold = &m[i];
 				vm_page_wire(&m[i]);
 			}
 			vm_page_xunbusy(&m[i]);
 		}
-		if (m_mtx != NULL)
-			mtx_unlock(m_mtx);
 	}
 	curthread->td_ru.ru_majflt++;
 	return (KERN_SUCCESS);
@@ -684,6 +674,42 @@ vm_fault_lock_vnode(struct faultstate *fs)
 	return (KERN_RESOURCE_SHORTAGE);
 }
 
+/*
+ * Wait/Retry if the page is busy.  We have to do this if the page is
+ * either exclusive or shared busy because the vm_pager may be using
+ * read busy for pageouts (and even pageins if it is the vnode pager),
+ * and we could end up trying to pagein and pageout the same page
+ * simultaneously.
+ *
+ * We can theoretically allow the busy case on a read fault if the page
+ * is marked valid, but since such pages are typically already pmap'd,
+ * putting that special case in might be more effort then it is worth.
+ * We cannot under any circumstances mess around with a shared busied
+ * page except, perhaps, to pmap it.
+ */
+static void
+vm_fault_busy_sleep(struct faultstate *fs)
+{
+	/*
+	 * Reference the page before unlocking and
+	 * sleeping so that the page daemon is less
+	 * likely to reclaim it.
+	 */
+	vm_page_aflag_set(fs->m, PGA_REFERENCED);
+	if (fs->object != fs->first_object) {
+		fault_page_release(&fs->first_m);
+		vm_object_pip_wakeup(fs->first_object);
+	}
+	vm_object_pip_wakeup(fs->object);
+	unlock_map(fs);
+	if (fs->m == vm_page_lookup(fs->object, fs->pindex))
+		vm_page_busy_sleep(fs->m, "vmpfw", false);
+	else
+		VM_OBJECT_WUNLOCK(fs->object);
+	VM_CNT_INC(v_intrans);
+	vm_object_deallocate(fs->first_object);
+}
+
 int
 vm_fault(vm_map_t map, vm_offset_t vaddr, vm_prot_t fault_type,
     int fault_flags, vm_page_t *m_hold)
@@ -822,42 +848,8 @@ RetryFault_oom:
 		 */
 		fs.m = vm_page_lookup(fs.object, fs.pindex);
 		if (fs.m != NULL) {
-			/*
-			 * Wait/Retry if the page is busy.  We have to do this
-			 * if the page is either exclusive or shared busy
-			 * because the vm_pager may be using read busy for
-			 * pageouts (and even pageins if it is the vnode
-			 * pager), and we could end up trying to pagein and
-			 * pageout the same page simultaneously.
-			 *
-			 * We can theoretically allow the busy case on a read
-			 * fault if the page is marked valid, but since such
-			 * pages are typically already pmap'd, putting that
-			 * special case in might be more effort then it is 
-			 * worth.  We cannot under any circumstances mess
-			 * around with a shared busied page except, perhaps,
-			 * to pmap it.
-			 */
 			if (vm_page_tryxbusy(fs.m) == 0) {
-				/*
-				 * Reference the page before unlocking and
-				 * sleeping so that the page daemon is less
-				 * likely to reclaim it.
-				 */
-				vm_page_aflag_set(fs.m, PGA_REFERENCED);
-				if (fs.object != fs.first_object) {
-					fault_page_release(&fs.first_m);
-					vm_object_pip_wakeup(fs.first_object);
-				}
-				unlock_map(&fs);
-				vm_object_pip_wakeup(fs.object);
-				if (fs.m == vm_page_lookup(fs.object,
-				    fs.pindex)) {
-					vm_page_sleep_if_busy(fs.m, "vmpfw");
-				}
-				VM_OBJECT_WUNLOCK(fs.object);
-				VM_CNT_INC(v_intrans);
-				vm_object_deallocate(fs.first_object);
+				vm_fault_busy_sleep(&fs);
 				goto RetryFault;
 			}
 
@@ -1228,10 +1220,14 @@ readrest:
 				 */
 			    fs.object == fs.first_object->backing_object) {
 
-				(void)vm_page_remove(fs.m);
-				vm_page_replace_checked(fs.m, fs.first_object,
+				/*
+				 * Remove but keep xbusy for replace.  fs.m is
+				 * moved into fs.first_object and left busy
+				 * while fs.first_m is conditionally freed.
+				 */
+				vm_page_remove_xbusy(fs.m);
+				vm_page_replace(fs.m, fs.first_object,
 				    fs.first_pindex, fs.first_m);
-				vm_page_free(fs.first_m);
 				vm_page_dirty(fs.m);
 #if VM_NRESERVLEVEL > 0
 				/*
@@ -1387,13 +1383,10 @@ readrest:
 	 * If the page is not wired down, then put it where the pageout daemon
 	 * can find it.
 	 */
-	if ((fault_flags & VM_FAULT_WIRE) != 0) {
+	if ((fault_flags & VM_FAULT_WIRE) != 0)
 		vm_page_wire(fs.m);
-	} else {
-		vm_page_lock(fs.m);
+	else
 		vm_page_activate(fs.m);
-		vm_page_unlock(fs.m);
-	}
 	if (m_hold != NULL) {
 		*m_hold = fs.m;
 		vm_page_wire(fs.m);
@@ -1493,12 +1486,13 @@ vm_fault_dontneed(const struct faultstate *fs, vm_offset_t vaddr, int ahead)
 				 * Typically, at this point, prefetched pages
 				 * are still in the inactive queue.  Only
 				 * pages that triggered page faults are in the
-				 * active queue.
+				 * active queue.  The test for whether the page
+				 * is in the inactive queue is racy; in the
+				 * worst case we will requeue the page
+				 * unnecessarily.
 				 */
-				vm_page_lock(m);
 				if (!vm_page_inactive(m))
 					vm_page_deactivate(m);
-				vm_page_unlock(m);
 			}
 		}
 	}
@@ -1873,9 +1867,7 @@ again:
 				    ("dst_m %p is not wired", dst_m));
 			}
 		} else {
-			vm_page_lock(dst_m);
 			vm_page_activate(dst_m);
-			vm_page_unlock(dst_m);
 		}
 		vm_page_xunbusy(dst_m);
 	}
