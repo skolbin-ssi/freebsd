@@ -140,18 +140,23 @@ struct lock_class lock_class_mtx_spin = {
 };
 
 #ifdef ADAPTIVE_MUTEXES
+#ifdef MUTEX_CUSTOM_BACKOFF
 static SYSCTL_NODE(_debug, OID_AUTO, mtx, CTLFLAG_RD, NULL, "mtx debugging");
 
 static struct lock_delay_config __read_frequently mtx_delay;
 
-SYSCTL_INT(_debug_mtx, OID_AUTO, delay_base, CTLFLAG_RW, &mtx_delay.base,
+SYSCTL_U16(_debug_mtx, OID_AUTO, delay_base, CTLFLAG_RW, &mtx_delay.base,
     0, "");
-SYSCTL_INT(_debug_mtx, OID_AUTO, delay_max, CTLFLAG_RW, &mtx_delay.max,
+SYSCTL_U16(_debug_mtx, OID_AUTO, delay_max, CTLFLAG_RW, &mtx_delay.max,
     0, "");
 
 LOCK_DELAY_SYSINIT_DEFAULT(mtx_delay);
+#else
+#define mtx_delay	locks_delay
+#endif
 #endif
 
+#ifdef MUTEX_SPIN_CUSTOM_BACKOFF
 static SYSCTL_NODE(_debug, OID_AUTO, mtx_spin, CTLFLAG_RD, NULL,
     "mtx spin debugging");
 
@@ -163,6 +168,9 @@ SYSCTL_INT(_debug_mtx_spin, OID_AUTO, delay_max, CTLFLAG_RW,
     &mtx_spin_delay.max, 0, "");
 
 LOCK_DELAY_SYSINIT_DEFAULT(mtx_spin_delay);
+#else
+#define mtx_spin_delay	locks_delay
+#endif
 
 /*
  * System-wide mutexes
@@ -1063,7 +1071,7 @@ __mtx_assert(const volatile uintptr_t *c, int what, const char *file, int line)
 {
 	const struct mtx *m;
 
-	if (panicstr != NULL || dumping || SCHEDULER_STOPPED())
+	if (KERNEL_PANICKED() || dumping || SCHEDULER_STOPPED())
 		return;
 
 	m = mtxlock2mtx(c);
@@ -1221,7 +1229,7 @@ _mtx_lock_indefinite_check(struct mtx *m, struct lock_delay_arg *ldap)
 	struct thread *td;
 
 	ldap->spin_cnt++;
-	if (ldap->spin_cnt < 60000000 || kdb_active || panicstr != NULL)
+	if (ldap->spin_cnt < 60000000 || kdb_active || KERNEL_PANICKED())
 		cpu_lock_delay();
 	else {
 		td = mtx_owner(m);

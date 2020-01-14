@@ -304,7 +304,7 @@ vnet_route_init(const void *unused __unused)
 			rnh = rt_tables_get_rnh_ptr(table, fam);
 			if (rnh == NULL)
 				panic("%s: rnh NULL", __func__);
-			dom->dom_rtattach((void **)rnh, 0);
+			dom->dom_rtattach((void **)rnh, 0, table);
 		}
 	}
 }
@@ -345,7 +345,7 @@ VNET_SYSUNINIT(vnet_route_uninit, SI_SUB_PROTO_DOMAIN, SI_ORDER_FIRST,
 #endif
 
 struct rib_head *
-rt_table_init(int offset)
+rt_table_init(int offset, int family, u_int fibnum)
 {
 	struct rib_head *rh;
 
@@ -356,6 +356,13 @@ rt_table_init(int offset)
 	rn_inithead_internal(&rh->head, rh->rnh_nodes, offset);
 	rn_inithead_internal(&rh->rmhead.head, rh->rmhead.mask_nodes, 0);
 	rh->head.rnh_masks = &rh->rmhead;
+
+	/* Save metadata associated with this routing table. */
+	rh->rib_family = family;
+	rh->rib_fibnum = fibnum;
+#ifdef VIMAGE
+	rh->rib_vnet = curvnet;
+#endif
 
 	/* Init locks */
 	RIB_LOCK_INIT(rh);
@@ -2147,7 +2154,7 @@ rtinit1(struct ifaddr *ifa, int cmd, int flags, int fibnum)
 #endif
 			RT_ADDREF(rt);
 			RT_UNLOCK(rt);
-			rt_newaddrmsg_fib(cmd, ifa, error, rt, fibnum);
+			rt_newaddrmsg_fib(cmd, ifa, rt, fibnum);
 			RT_LOCK(rt);
 			RT_REMREF(rt);
 			if (cmd == RTM_DELETE) {
@@ -2233,17 +2240,16 @@ rt_addrmsg(int cmd, struct ifaddr *ifa, int fibnum)
 }
 
 /*
- * Announce route addition/removal.
- * Users of this function MUST validate input data BEFORE calling.
- * However we have to be able to handle invalid data:
- * if some userland app sends us "invalid" route message (invalid mask,
- * no dst, wrong address families, etc...) we need to pass it back
- * to app (and any other rtsock consumers) with rtm_errno field set to
- * non-zero value.
+ * Announce kernel-originated route addition/removal to rtsock based on @rt data.
+ * cmd: RTM_ cmd
+ * @rt: valid rtentry
+ * @ifp: target route interface
+ * @fibnum: fib id or RT_ALL_FIBS
+ *
  * Returns 0 on success.
  */
 int
-rt_routemsg(int cmd, struct ifnet *ifp, int error, struct rtentry *rt,
+rt_routemsg(int cmd, struct rtentry *rt, struct ifnet *ifp, int rti_addrs,
     int fibnum)
 {
 
@@ -2255,23 +2261,39 @@ rt_routemsg(int cmd, struct ifnet *ifp, int error, struct rtentry *rt,
 
 	KASSERT(rt_key(rt) != NULL, (":%s: rt_key must be supplied", __func__));
 
-	return (rtsock_routemsg(cmd, ifp, error, rt, fibnum));
+	return (rtsock_routemsg(cmd, rt, ifp, 0, fibnum));
 }
 
-void
-rt_newaddrmsg(int cmd, struct ifaddr *ifa, int error, struct rtentry *rt)
+/*
+ * Announce kernel-originated route addition/removal to rtsock based on @rt data.
+ * cmd: RTM_ cmd
+ * @info: addrinfo structure with valid data.
+ * @fibnum: fib id or RT_ALL_FIBS
+ *
+ * Returns 0 on success.
+ */
+int
+rt_routemsg_info(int cmd, struct rt_addrinfo *info, int fibnum)
 {
 
-	rt_newaddrmsg_fib(cmd, ifa, error, rt, RT_ALL_FIBS);
+	KASSERT(cmd == RTM_ADD || cmd == RTM_DELETE || cmd == RTM_CHANGE,
+	    ("unexpected cmd %d", cmd));
+	
+	KASSERT(fibnum == RT_ALL_FIBS || (fibnum >= 0 && fibnum < rt_numfibs),
+	    ("%s: fib out of range 0 <=%d<%d", __func__, fibnum, rt_numfibs));
+
+	KASSERT(info->rti_info[RTAX_DST] != NULL, (":%s: RTAX_DST must be supplied", __func__));
+
+	return (rtsock_routemsg_info(cmd, info, fibnum));
 }
+
 
 /*
  * This is called to generate messages from the routing socket
  * indicating a network interface has had addresses associated with it.
  */
 void
-rt_newaddrmsg_fib(int cmd, struct ifaddr *ifa, int error, struct rtentry *rt,
-    int fibnum)
+rt_newaddrmsg_fib(int cmd, struct ifaddr *ifa, struct rtentry *rt, int fibnum)
 {
 
 	KASSERT(cmd == RTM_ADD || cmd == RTM_DELETE,
@@ -2282,10 +2304,10 @@ rt_newaddrmsg_fib(int cmd, struct ifaddr *ifa, int error, struct rtentry *rt,
 	if (cmd == RTM_ADD) {
 		rt_addrmsg(cmd, ifa, fibnum);
 		if (rt != NULL)
-			rt_routemsg(cmd, ifa->ifa_ifp, error, rt, fibnum);
+			rt_routemsg(cmd, rt, ifa->ifa_ifp, 0, fibnum);
 	} else {
 		if (rt != NULL)
-			rt_routemsg(cmd, ifa->ifa_ifp, error, rt, fibnum);
+			rt_routemsg(cmd, rt, ifa->ifa_ifp, 0, fibnum);
 		rt_addrmsg(cmd, ifa, fibnum);
 	}
 }

@@ -2263,6 +2263,8 @@ tcp_pcblist(SYSCTL_HANDLER_ARGS)
 	    inp = CK_LIST_NEXT(inp, inp_list)) {
 		INP_RLOCK(inp);
 		if (inp->inp_gencnt <= xig.xig_gen) {
+			int crerr;
+
 			/*
 			 * XXX: This use of cr_cansee(), introduced with
 			 * TCP state changes, is not quite right, but for
@@ -2270,13 +2272,13 @@ tcp_pcblist(SYSCTL_HANDLER_ARGS)
 			 */
 			if (inp->inp_flags & INP_TIMEWAIT) {
 				if (intotw(inp) != NULL)
-					error = cr_cansee(req->td->td_ucred,
+					crerr = cr_cansee(req->td->td_ucred,
 					    intotw(inp)->tw_cred);
 				else
-					error = EINVAL;	/* Skip this inp. */
+					crerr = EINVAL;	/* Skip this inp. */
 			} else
-				error = cr_canseeinpcb(req->td->td_ucred, inp);
-			if (error == 0) {
+				crerr = cr_canseeinpcb(req->td->td_ucred, inp);
+			if (crerr == 0) {
 				struct xtcpcb xt;
 
 				tcp_inptoxtp(inp, &xt);
@@ -3283,7 +3285,7 @@ tcp_log_vain(struct in_conninfo *inc, struct tcphdr *th, void *ip4hdr,
 {
 
 	/* Is logging enabled? */
-	if (tcp_log_in_vain == 0)
+	if (V_tcp_log_in_vain == 0)
 		return (NULL);
 
 	return (tcp_log_addr(inc, th, ip4hdr, ip6hdr));

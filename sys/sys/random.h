@@ -102,6 +102,7 @@ enum random_entropy_source {
 	RANDOM_PURE_CCP,
 	RANDOM_PURE_DARN,
 	RANDOM_PURE_TPM,
+	RANDOM_PURE_VMGENID,
 	ENTROPYSOURCE
 };
 _Static_assert(ENTROPYSOURCE <= 32,
@@ -158,6 +159,7 @@ void random_harvest_deregister_source(enum random_entropy_source);
 
 #define GRND_NONBLOCK	0x1
 #define GRND_RANDOM	0x2
+#define GRND_INSECURE	0x4
 
 __BEGIN_DECLS
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags);

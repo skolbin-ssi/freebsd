@@ -138,6 +138,7 @@ static fo_fill_kinfo_t	shm_fill_kinfo;
 static fo_mmap_t	shm_mmap;
 static fo_get_seals_t	shm_get_seals;
 static fo_add_seals_t	shm_add_seals;
+static fo_fallocate_t	shm_fallocate;
 
 /* File descriptor operations. */
 struct fileops shm_ops = {
@@ -157,6 +158,7 @@ struct fileops shm_ops = {
 	.fo_mmap = shm_mmap,
 	.fo_get_seals = shm_get_seals,
 	.fo_add_seals = shm_add_seals,
+	.fo_fallocate = shm_fallocate,
 	.fo_flags = DFLAG_PASSABLE | DFLAG_SEEKABLE
 };
 
@@ -731,8 +733,8 @@ shm_remove(char *path, Fnv32_t fnv, struct ucred *ucred)
 }
 
 int
-kern_shm_open(struct thread *td, const char *userpath, int flags, mode_t mode,
-    struct filecaps *fcaps, int initial_seals)
+kern_shm_open2(struct thread *td, const char *userpath, int flags, mode_t mode,
+    int shmflags, struct filecaps *fcaps, const char *name __unused)
 {
 	struct filedesc *fdp;
 	struct shmfd *shmfd;
@@ -741,7 +743,14 @@ kern_shm_open(struct thread *td, const char *userpath, int flags, mode_t mode,
 	void *rl_cookie;
 	Fnv32_t fnv;
 	mode_t cmode;
-	int fd, error;
+	int error, fd, initial_seals;
+
+	if ((shmflags & ~SHM_ALLOW_SEALING) != 0)
+		return (EINVAL);
+
+	initial_seals = F_SEAL_SEAL;
+	if ((shmflags & SHM_ALLOW_SEALING) != 0)
+		initial_seals &= ~F_SEAL_SEAL;
 
 #ifdef CAPABILITY_MODE
 	/*
@@ -923,8 +932,8 @@ int
 freebsd12_shm_open(struct thread *td, struct freebsd12_shm_open_args *uap)
 {
 
-	return (kern_shm_open(td, uap->path, uap->flags | O_CLOEXEC, uap->mode,
-	    NULL, F_SEAL_SEAL));
+	return (kern_shm_open(td, uap->path, uap->flags | O_CLOEXEC,
+	    uap->mode, NULL));
 }
 #endif
 
@@ -1116,7 +1125,13 @@ shm_mmap(struct file *fp, vm_map_t map, vm_offset_t *addr, vm_size_t objsize,
 	/* FREAD should always be set. */
 	if ((fp->f_flag & FREAD) != 0)
 		maxprot |= VM_PROT_EXECUTE | VM_PROT_READ;
-	if ((fp->f_flag & FWRITE) != 0)
+
+	/*
+	 * If FWRITE's set, we can allow VM_PROT_WRITE unless it's a shared
+	 * mapping with a write seal applied.
+	 */
+	if ((fp->f_flag & FWRITE) != 0 && ((flags & MAP_SHARED) == 0 ||
+	    (shmfd->shm_seals & F_SEAL_WRITE) == 0))
 		maxprot |= VM_PROT_WRITE;
 
 	writecnt = (flags & MAP_SHARED) != 0 && (prot & VM_PROT_WRITE) != 0;
@@ -1425,6 +1440,42 @@ shm_get_seals(struct file *fp, int *seals)
 }
 
 static int
+shm_fallocate(struct file *fp, off_t offset, off_t len, struct thread *td)
+{
+	void *rl_cookie;
+	struct shmfd *shmfd;
+	size_t size;
+	int error;
+
+	/* This assumes that the caller already checked for overflow. */
+	error = 0;
+	shmfd = fp->f_data;
+	size = offset + len;
+
+	/*
+	 * Just grab the rangelock for the range that we may be attempting to
+	 * grow, rather than blocking read/write for regions we won't be
+	 * touching while this (potential) resize is in progress.  Other
+	 * attempts to resize the shmfd will have to take a write lock from 0 to
+	 * OFF_MAX, so this being potentially beyond the current usable range of
+	 * the shmfd is not necessarily a concern.  If other mechanisms are
+	 * added to grow a shmfd, this may need to be re-evaluated.
+	 */
+	rl_cookie = rangelock_wlock(&shmfd->shm_rl, offset, size,
+	    &shmfd->shm_mtx);
+	if (size > shmfd->shm_size) {
+		VM_OBJECT_WLOCK(shmfd->shm_object);
+		error = shm_dotruncate_locked(shmfd, size, rl_cookie);
+		VM_OBJECT_WUNLOCK(shmfd->shm_object);
+	}
+	rangelock_unlock(&shmfd->shm_rl, rl_cookie, &shmfd->shm_mtx);
+	/* Translate to posix_fallocate(2) return value as needed. */
+	if (error == ENOMEM)
+		error = ENOSPC;
+	return (error);
+}
+
+static int
 sysctl_posix_shm_list(SYSCTL_HANDLER_ARGS)
 {
 	struct shm_mapping *shmm;
@@ -1470,18 +1521,11 @@ SYSCTL_PROC(_kern_ipc, OID_AUTO, posix_shm_list,
     "POSIX SHM list");
 
 int
-kern_shm_open2(struct thread *td, const char *path, int flags, mode_t mode,
-    int shmflags, const char *name __unused)
+kern_shm_open(struct thread *td, const char *path, int flags, mode_t mode,
+    struct filecaps *caps)
 {
-	int initial_seals;
 
-	if ((shmflags & ~SHM_ALLOW_SEALING) != 0)
-		return (EINVAL);
-
-	initial_seals = F_SEAL_SEAL;
-	if ((shmflags & SHM_ALLOW_SEALING) != 0)
-		initial_seals &= ~F_SEAL_SEAL;
-	return (kern_shm_open(td, path, flags, mode, NULL, initial_seals));
+	return (kern_shm_open2(td, path, flags, mode, 0, caps, NULL));
 }
 
 /*
@@ -1499,5 +1543,5 @@ sys_shm_open2(struct thread *td, struct shm_open2_args *uap)
 {
 
 	return (kern_shm_open2(td, uap->path, uap->flags, uap->mode,
-	    uap->shmflags, uap->name));
+	    uap->shmflags, NULL, uap->name));
 }

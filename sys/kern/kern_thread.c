@@ -82,7 +82,7 @@ _Static_assert(offsetof(struct thread, td_flags) == 0xfc,
     "struct thread KBI td_flags");
 _Static_assert(offsetof(struct thread, td_pflags) == 0x104,
     "struct thread KBI td_pflags");
-_Static_assert(offsetof(struct thread, td_frame) == 0x478,
+_Static_assert(offsetof(struct thread, td_frame) == 0x480,
     "struct thread KBI td_frame");
 _Static_assert(offsetof(struct thread, td_emuldata) == 0x690,
     "struct thread KBI td_emuldata");
@@ -1072,6 +1072,49 @@ thread_suspend_check(int return_instead)
 		PROC_LOCK(p);
 	}
 	return (0);
+}
+
+/*
+ * Check for possible stops and suspensions while executing a
+ * casueword or similar transiently failing operation.
+ *
+ * The sleep argument controls whether the function can handle a stop
+ * request itself or it should return ERESTART and the request is
+ * proceed at the kernel/user boundary in ast.
+ *
+ * Typically, when retrying due to casueword(9) failure (rv == 1), we
+ * should handle the stop requests there, with exception of cases when
+ * the thread owns a kernel resource, for instance busied the umtx
+ * key, or when functions return immediately if casueword_check_susp()
+ * returned non-zero.  On the other hand, retrying the whole lock
+ * operation, we better not stop there but delegate the handling to
+ * ast.
+ *
+ * If the request is for thread termination P_SINGLE_EXIT, we cannot
+ * handle it at all, and simply return EINTR.
+ */
+int
+thread_check_susp(struct thread *td, bool sleep)
+{
+	struct proc *p;
+	int error;
+
+	/*
+	 * The check for TDF_NEEDSUSPCHK is racy, but it is enough to
+	 * eventually break the lockstep loop.
+	 */
+	if ((td->td_flags & TDF_NEEDSUSPCHK) == 0)
+		return (0);
+	error = 0;
+	p = td->td_proc;
+	PROC_LOCK(p);
+	if (p->p_flag & P_SINGLE_EXIT)
+		error = EINTR;
+	else if (P_SHOULDSTOP(p) ||
+	    ((p->p_flag & P_TRACED) && (td->td_dbgflags & TDB_SUSPEND)))
+		error = sleep ? thread_suspend_check(0) : ERESTART;
+	PROC_UNLOCK(p);
+	return (error);
 }
 
 void
