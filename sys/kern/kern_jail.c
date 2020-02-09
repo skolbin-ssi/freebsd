@@ -436,7 +436,6 @@ kern_jail(struct thread *td, struct jail *j)
 	return (error);
 }
 
-
 /*
  * struct jail_set_args {
  *	struct iovec *iovp;
@@ -491,7 +490,6 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 	int gotchildmax, gotenforce, gothid, gotrsnum, gotslevel;
 	int jid, jsys, len, level;
 	int childmax, osreldt, rsnum, slevel;
-	int fullpath_disabled;
 #if defined(INET) || defined(INET6)
 	int ii, ij;
 #endif
@@ -895,7 +893,6 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 		}
 	}
 
-	fullpath_disabled = 0;
 	root = NULL;
 	error = vfs_getopt(opts, "path", (void **)&path, &len);
 	if (error == ENOENT)
@@ -923,13 +920,8 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 		g_path = malloc(MAXPATHLEN, M_TEMP, M_WAITOK);
 		strlcpy(g_path, path, MAXPATHLEN);
 		error = vn_path_to_global_path(td, root, g_path, MAXPATHLEN);
-		if (error == 0)
+		if (error == 0) {
 			path = g_path;
-		else if (error == ENODEV) {
-			/* proceed if sysctl debug.disablefullpath == 1 */
-			fullpath_disabled = 1;
-			if (len < 2 || (len == 2 && path[0] == '/'))
-				path = NULL;
 		} else {
 			/* exit on other errors */
 			goto done_free;
@@ -940,15 +932,6 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 			goto done_free;
 		}
 		VOP_UNLOCK(root);
-		if (fullpath_disabled) {
-			/* Leave room for a real-root full pathname. */
-			if (len + (path[0] == '/' && strcmp(mypr->pr_path, "/")
-			    ? strlen(mypr->pr_path) : 0) > MAXPATHLEN) {
-				error = ENAMETOOLONG;
-				vrele(root);
-				goto done_free;
-			}
-		}
 	}
 
 	/*
@@ -1653,12 +1636,7 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 	}
 	if (path != NULL) {
 		/* Try to keep a real-rooted full pathname. */
-		if (fullpath_disabled && path[0] == '/' &&
-		    strcmp(mypr->pr_path, "/"))
-			snprintf(pr->pr_path, sizeof(pr->pr_path), "%s%s",
-			    mypr->pr_path, path);
-		else
-			strlcpy(pr->pr_path, path, sizeof(pr->pr_path));
+		strlcpy(pr->pr_path, path, sizeof(pr->pr_path));
 		pr->pr_root = root;
 	}
 	if (PR_HOST & ch_flags & ~pr_flags) {
@@ -1895,7 +1873,6 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 	vfs_freeopts(opts);
 	return (error);
 }
-
 
 /*
  * struct jail_get_args {
@@ -2208,7 +2185,6 @@ kern_jail_get(struct thread *td, struct uio *optuio, int flags)
 	return (error);
 }
 
-
 /*
  * struct jail_remove_args {
  *	int jid;
@@ -2307,7 +2283,6 @@ prison_remove_one(struct prison *pr)
 	/* Remove the temporary reference added by jail_remove. */
 	prison_deref(pr, deuref | PD_DEREF);
 }
-
 
 /*
  * struct jail_attach_args {
@@ -2424,7 +2399,6 @@ do_jail_attach(struct thread *td, struct prison *pr)
 	prison_deref(pr, PD_DEREF | PD_DEUREF);
 	return (error);
 }
-
 
 /*
  * Returns a locked prison instance, or NULL on failure.
@@ -3426,7 +3400,6 @@ prison_path(struct prison *pr1, struct prison *pr2)
 		return (path2 + len1);
 	return (path2);
 }
-
 
 /*
  * Jail-related sysctls.

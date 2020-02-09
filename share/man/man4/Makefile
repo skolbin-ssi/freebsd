@@ -553,7 +553,6 @@ MAN=	aac.4 \
 	${_vmd.4} \
 	${_vmm.4} \
 	${_vmx.4} \
-	vpo.4 \
 	vr.4 \
 	vt.4 \
 	vte.4 \
@@ -740,7 +739,6 @@ MLINKS+=vge.4 if_vge.4
 MLINKS+=vlan.4 if_vlan.4
 MLINKS+=vxlan.4 if_vxlan.4
 MLINKS+=${_vmx.4} ${_if_vmx.4}
-MLINKS+=vpo.4 imm.4
 MLINKS+=vr.4 if_vr.4
 MLINKS+=vte.4 if_vte.4
 MLINKS+=${_vtnet.4} ${_if_vtnet.4}
@@ -868,8 +866,16 @@ _nvram2env.4=	nvram2env.4
 .endif
 
 .if ${MACHINE_CPUARCH} == "powerpc"
+_if_vtnet.4=    if_vtnet.4
 _nvd.4= 	nvd.4
 _nvme.4=	nvme.4
+_virtio.4=	virtio.4
+_virtio_balloon.4=virtio_balloon.4
+_virtio_blk.4=	virtio_blk.4
+_virtio_console.4=virtio_console.4
+_virtio_random.4= virtio_random.4
+_virtio_scsi.4=	virtio_scsi.4
+_vtnet.4=	vtnet.4
 .endif
 
 .if empty(MAN_ARCH)
