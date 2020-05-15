@@ -525,14 +525,14 @@ linux_cdev_pager_populate(vm_object_t vm_obj, vm_pindex_t pidx, int fault_type,
 	struct vm_area_struct *vmap;
 	int err;
 
-	linux_set_current(curthread);
-
 	/* get VM area structure */
 	vmap = linux_cdev_handle_find(vm_obj->handle);
 	MPASS(vmap != NULL);
 	MPASS(vmap->vm_private_data == vm_obj->handle);
 
 	VM_OBJECT_WUNLOCK(vm_obj);
+
+	linux_set_current(curthread);
 
 	down_write(&vmap->vm_mm->mmap_sem);
 	if (unlikely(vmap->vm_ops == NULL)) {
@@ -1490,6 +1490,7 @@ static int
 linux_file_close(struct file *file, struct thread *td)
 {
 	struct linux_file *filp;
+	int (*release)(struct inode *, struct linux_file *);
 	const struct file_operations *fop;
 	struct linux_cdev *ldev;
 	int error;
@@ -1507,8 +1508,13 @@ linux_file_close(struct file *file, struct thread *td)
 	linux_set_current(td);
 	linux_poll_wait_dequeue(filp);
 	linux_get_fop(filp, &fop, &ldev);
-	if (fop->release != NULL)
-		error = -OPW(file, td, fop->release(filp->f_vnode, filp));
+	/*
+	 * Always use the real release function, if any, to avoid
+	 * leaking device resources:
+	 */
+	release = filp->f_op->release;
+	if (release != NULL)
+		error = -OPW(file, td, release(filp->f_vnode, filp));
 	funsetown(&filp->f_sigio);
 	if (filp->f_vnode != NULL)
 		vdrop(filp->f_vnode);

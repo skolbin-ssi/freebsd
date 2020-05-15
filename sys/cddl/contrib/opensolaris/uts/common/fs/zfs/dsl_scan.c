@@ -137,12 +137,6 @@ extern int zfs_vdev_async_write_active_min_dirty_percent;
  */
 int zfs_scan_strict_mem_lim = B_FALSE;
 
-/*
- * Maximum number of parallelly executing I/Os per top-level vdev.
- * Tune with care. Very high settings (hundreds) are known to trigger
- * some firmware bugs and resets on certain SSDs.
- */
-int zfs_top_maxinflight = 32;		/* maximum I/Os per top-level */
 unsigned int zfs_resilver_delay = 2;	/* number of ticks to delay resilver -- 2 is a good number */
 unsigned int zfs_scrub_delay = 4;	/* number of ticks to delay scrub -- 4 is a good number */
 unsigned int zfs_scan_idle = 50;	/* idle window in clock ticks */
@@ -186,8 +180,6 @@ boolean_t zfs_no_scrub_io = B_FALSE; /* set to disable scrub i/o */
 boolean_t zfs_no_scrub_prefetch = B_FALSE; /* set to disable scrub prefetch */
 
 SYSCTL_DECL(_vfs_zfs);
-SYSCTL_UINT(_vfs_zfs, OID_AUTO, top_maxinflight, CTLFLAG_RWTUN,
-    &zfs_top_maxinflight, 0, "Maximum I/Os per top-level vdev");
 SYSCTL_UINT(_vfs_zfs, OID_AUTO, resilver_delay, CTLFLAG_RWTUN,
     &zfs_resilver_delay, 0, "Number of ticks to delay resilver");
 SYSCTL_UINT(_vfs_zfs, OID_AUTO, scrub_delay, CTLFLAG_RWTUN,
@@ -1113,10 +1105,13 @@ scan_ds_queue_sync(dsl_scan_t *scn, dmu_tx_t *tx)
 static boolean_t
 dsl_scan_should_clear(dsl_scan_t *scn)
 {
+	spa_t *spa = scn->scn_dp->dp_spa;
 	vdev_t *rvd = scn->scn_dp->dp_spa->spa_root_vdev;
-	uint64_t mlim_hard, mlim_soft, mused;
-	uint64_t alloc = metaslab_class_get_alloc(spa_normal_class(
-	    scn->scn_dp->dp_spa));
+	uint64_t alloc, mlim_hard, mlim_soft, mused;
+
+	alloc = metaslab_class_get_alloc(spa_normal_class(spa));
+	alloc += metaslab_class_get_alloc(spa_special_class(spa));
+	alloc += metaslab_class_get_alloc(spa_dedup_class(spa));
 
 	mlim_hard = MAX((physmem / zfs_scan_mem_lim_fact) * PAGESIZE,
 	    zfs_scan_mem_lim_min);
@@ -1538,7 +1533,6 @@ dsl_scan_prefetch_thread(void *arg)
 	dsl_scan_t *scn = arg;
 	spa_t *spa = scn->scn_dp->dp_spa;
 	vdev_t *rvd = spa->spa_root_vdev;
-	uint64_t maxinflight = rvd->vdev_children * zfs_top_maxinflight;
 	scan_prefetch_issue_ctx_t *spic;
 
 	/* loop until we are told to stop */

@@ -117,6 +117,16 @@ static uma_zone_t kegs;
 static uma_zone_t zones;
 
 /*
+ * On INVARIANTS builds, the slab contains a second bitset of the same size,
+ * "dbg_bits", which is laid out immediately after us_free.
+ */
+#ifdef INVARIANTS
+#define	SLAB_BITSETS	2
+#else
+#define	SLAB_BITSETS	1
+#endif
+
+/*
  * These are the two zones from which all offpage uma_slab_ts are allocated.
  *
  * One zone is for slab headers that can represent a larger number of items,
@@ -182,6 +192,7 @@ SYSCTL_ULONG(_vm, OID_AUTO, uma_kmem_total, CTLFLAG_RD, &uma_kmem_total, 0,
 static enum {
 	BOOT_COLD,
 	BOOT_KVA,
+	BOOT_PCPU,
 	BOOT_RUNNING,
 	BOOT_SHUTDOWN,
 } booted = BOOT_COLD;
@@ -294,7 +305,6 @@ static int hash_alloc(struct uma_hash *, u_int);
 static int hash_expand(struct uma_hash *, struct uma_hash *);
 static void hash_free(struct uma_hash *hash);
 static void uma_timeout(void *);
-static void uma_startup3(void);
 static void uma_shutdown(void);
 static void *zone_alloc_item(uma_zone_t, void *, int, int);
 static void zone_free_item(uma_zone_t, void *, void *, enum zfreeskip);
@@ -349,8 +359,6 @@ SYSCTL_COUNTER_U64(_vm_debug, OID_AUTO, trashed, CTLFLAG_RD,
 SYSCTL_COUNTER_U64(_vm_debug, OID_AUTO, skipped, CTLFLAG_RD,
     &uma_skip_cnt, "memory items skipped, not debugged");
 #endif
-
-SYSINIT(uma_startup3, SI_SUB_VM_CONF, SI_ORDER_SECOND, uma_startup3, NULL);
 
 SYSCTL_NODE(_vm, OID_AUTO, uma, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "Universal Memory Allocator");
@@ -715,9 +723,6 @@ zone_put_bucket(uma_zone_t zone, int domain, uma_bucket_t bucket, void *udata,
 	if (bucket->ub_cnt == 0)
 		goto out;
 	zdom = zone_domain_lock(zone, domain);
-
-	KASSERT(!ws || zdom->uzd_nitems < zone->uz_bucket_max,
-	    ("%s: zone %p overflow", __func__, zone));
 
 	/*
 	 * Conditionally set the maximum number of items.
@@ -1901,7 +1906,7 @@ zero_init(void *mem, int size, int flags)
 }
 
 #ifdef INVARIANTS
-struct noslabbits *
+static struct noslabbits *
 slab_dbg_bits(uma_slab_t slab, uma_keg_t keg)
 {
 
@@ -1912,22 +1917,13 @@ slab_dbg_bits(uma_slab_t slab, uma_keg_t keg)
 /*
  * Actual size of embedded struct slab (!OFFPAGE).
  */
-size_t
+static size_t
 slab_sizeof(int nitems)
 {
 	size_t s;
 
 	s = sizeof(struct uma_slab) + BITSET_SIZE(nitems) * SLAB_BITSETS;
 	return (roundup(s, UMA_ALIGN_PTR + 1));
-}
-
-/*
- * Size of memory for embedded slabs (!OFFPAGE).
- */
-size_t
-slab_space(int nitems)
-{
-	return (UMA_SLAB_SIZE - slab_sizeof(nitems));
 }
 
 #define	UMA_FIXPT_SHIFT	31
@@ -1968,18 +1964,6 @@ slab_ipers_hdr(u_int size, u_int rsize, u_int slabsize, bool hdr)
 	}
 
 	return (ipers);
-}
-
-/*
- * Compute the number of items that will fit in a slab for a startup zone.
- */
-int
-slab_ipers(size_t size, int align)
-{
-	int rsize;
-
-	rsize = roundup(size, align + 1); /* Assume no CACHESPREAD */
-	return (slab_ipers_hdr(size, rsize, UMA_SLAB_SIZE, true));
 }
 
 struct keg_layout_result {
@@ -2672,9 +2656,10 @@ zone_ctor(void *mem, int size, void *udata, int flags)
 	    (UMA_ZONE_INHERIT | UMA_ZFLAG_INHERIT));
 
 out:
-	if (__predict_true(booted >= BOOT_RUNNING)) {
+	if (booted >= BOOT_PCPU) {
 		zone_alloc_counters(zone, NULL);
-		zone_alloc_sysctl(zone, NULL);
+		if (booted >= BOOT_RUNNING)
+			zone_alloc_sysctl(zone, NULL);
 	} else {
 		zone->uz_allocs = EARLY_COUNTER;
 		zone->uz_frees = EARLY_COUNTER;
@@ -2918,10 +2903,23 @@ uma_startup2(void)
 }
 
 /*
+ * Allocate counters as early as possible so that boot-time allocations are
+ * accounted more precisely.
+ */
+static void
+uma_startup_pcpu(void *arg __unused)
+{
+
+	zone_foreach_unlocked(zone_alloc_counters, NULL);
+	booted = BOOT_PCPU;
+}
+SYSINIT(uma_startup_pcpu, SI_SUB_COUNTER, SI_ORDER_ANY, uma_startup_pcpu, NULL);
+
+/*
  * Finish our initialization steps.
  */
 static void
-uma_startup3(void)
+uma_startup3(void *arg __unused)
 {
 
 #ifdef INVARIANTS
@@ -2929,7 +2927,6 @@ uma_startup3(void)
 	uma_dbg_cnt = counter_u64_alloc(M_WAITOK);
 	uma_skip_cnt = counter_u64_alloc(M_WAITOK);
 #endif
-	zone_foreach_unlocked(zone_alloc_counters, NULL);
 	zone_foreach_unlocked(zone_alloc_sysctl, NULL);
 	callout_init(&uma_callout, 1);
 	callout_reset(&uma_callout, UMA_TIMEOUT * hz, uma_timeout, NULL);
@@ -2938,6 +2935,7 @@ uma_startup3(void)
 	EVENTHANDLER_REGISTER(shutdown_post_sync, uma_shutdown, NULL,
 	    EVENTHANDLER_PRI_FIRST);
 }
+SYSINIT(uma_startup3, SI_SUB_VM_CONF, SI_ORDER_SECOND, uma_startup3, NULL);
 
 static void
 uma_shutdown(void)
@@ -4659,6 +4657,9 @@ uma_zone_set_smr(uma_zone_t zone, smr_t smr)
 
 	ZONE_ASSERT_COLD(zone);
 
+	KASSERT(smr != NULL, ("Got NULL smr"));
+	KASSERT((zone->uz_flags & UMA_ZONE_SMR) == 0,
+	    ("zone %p (%s) already uses SMR", zone, zone->uz_name));
 	zone->uz_flags |= UMA_ZONE_SMR;
 	zone->uz_smr = smr;
 	zone_update_caches(zone);

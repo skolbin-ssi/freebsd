@@ -119,9 +119,9 @@ SYSCTL_INT(_kern, OID_AUTO, panic_reboot_wait_time, CTLFLAG_RWTUN,
 
 #ifdef KDB
 #ifdef KDB_UNATTENDED
-static int debugger_on_panic = 0;
+int debugger_on_panic = 0;
 #else
-static int debugger_on_panic = 1;
+int debugger_on_panic = 1;
 #endif
 SYSCTL_INT(_debug, OID_AUTO, debugger_on_panic,
     CTLFLAG_RWTUN | CTLFLAG_SECURE,
@@ -167,7 +167,8 @@ static int show_busybufs;
 static int show_busybufs = 1;
 #endif
 SYSCTL_INT(_kern_shutdown, OID_AUTO, show_busybufs, CTLFLAG_RW,
-	&show_busybufs, 0, "");
+    &show_busybufs, 0,
+    "Show busy buffers during shutdown");
 
 int suspend_blocked = 0;
 SYSCTL_INT(_kern, OID_AUTO, suspend_blocked, CTLFLAG_RW,
@@ -1230,6 +1231,7 @@ dumper_insert(const struct dumperinfo *di_template, const char *devname,
 #endif
 	}
 	if (kda->kda_compression != KERNELDUMP_COMP_NONE) {
+#ifdef EKCD
 		/*
 		 * We can't support simultaneous unpadded block cipher
 		 * encryption and compression because there is no guarantee the
@@ -1240,6 +1242,7 @@ dumper_insert(const struct dumperinfo *di_template, const char *devname,
 			error = EOPNOTSUPP;
 			goto cleanup;
 		}
+#endif
 		newdi->kdcomp = kerneldumpcomp_create(newdi,
 		    kda->kda_compression);
 		if (newdi->kdcomp == NULL) {

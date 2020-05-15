@@ -31,6 +31,8 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
+#include "opt_bhyve_snapshot.h"
+
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/jail.h>
@@ -53,8 +55,10 @@ __FBSDID("$FreeBSD$");
 
 #include <machine/vmparam.h>
 #include <machine/vmm.h>
-#include <machine/vmm_instruction_emul.h>
 #include <machine/vmm_dev.h>
+#include <machine/vmm_instruction_emul.h>
+#include <machine/vmm_snapshot.h>
+#include <x86/apicreg.h>
 
 #include "vmm_lapic.h"
 #include "vmm_stat.h"
@@ -379,8 +383,12 @@ vmmdev_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	struct vm_rtc_data *rtcdata;
 	struct vm_memmap *mm;
 	struct vm_cpu_topology *topology;
+	struct vm_readwrite_kernemu_device *kernemu;
 	uint64_t *regvals;
 	int *regnums;
+#ifdef BHYVE_SNAPSHOT
+	struct vm_snapshot_meta *snapshot_meta;
+#endif
 
 	error = vmm_priv_check(curthread->td_ucred);
 	if (error)
@@ -555,6 +563,41 @@ vmmdev_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	case VM_IOAPIC_PINCOUNT:
 		*(int *)data = vioapic_pincount(sc->vm);
 		break;
+	case VM_SET_KERNEMU_DEV:
+	case VM_GET_KERNEMU_DEV: {
+		mem_region_write_t mwrite;
+		mem_region_read_t mread;
+		bool arg;
+
+		kernemu = (void *)data;
+
+		if (kernemu->access_width > 0)
+			size = (1u << kernemu->access_width);
+		else
+			size = 1;
+
+		if (kernemu->gpa >= DEFAULT_APIC_BASE && kernemu->gpa < DEFAULT_APIC_BASE + PAGE_SIZE) {
+			mread = lapic_mmio_read;
+			mwrite = lapic_mmio_write;
+		} else if (kernemu->gpa >= VIOAPIC_BASE && kernemu->gpa < VIOAPIC_BASE + VIOAPIC_SIZE) {
+			mread = vioapic_mmio_read;
+			mwrite = vioapic_mmio_write;
+		} else if (kernemu->gpa >= VHPET_BASE && kernemu->gpa < VHPET_BASE + VHPET_SIZE) {
+			mread = vhpet_mmio_read;
+			mwrite = vhpet_mmio_write;
+		} else {
+			error = EINVAL;
+			break;
+		}
+
+		if (cmd == VM_SET_KERNEMU_DEV)
+			error = mwrite(sc->vm, kernemu->vcpuid, kernemu->gpa,
+			    kernemu->value, size, &arg);
+		else
+			error = mread(sc->vm, kernemu->vcpuid, kernemu->gpa,
+			    &kernemu->value, size, &arg);
+		break;
+		}
 	case VM_ISA_ASSERT_IRQ:
 		isa_irq = (struct vm_isa_irq *)data;
 		error = vatpic_assert_irq(sc->vm, isa_irq->atpic_irq);
@@ -784,6 +827,15 @@ vmmdev_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    &topology->threads, &topology->maxcpus);
 		error = 0;
 		break;
+#ifdef BHYVE_SNAPSHOT
+	case VM_SNAPSHOT_REQ:
+		snapshot_meta = (struct vm_snapshot_meta *)data;
+		error = vm_snapshot_req(sc->vm, snapshot_meta);
+		break;
+	case VM_RESTORE_TIME:
+		error = vm_restore_time(sc->vm);
+		break;
+#endif
 	default:
 		error = ENOTTY;
 		break;

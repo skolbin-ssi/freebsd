@@ -130,30 +130,20 @@ static int vm_pageproc_waiters;
 static SYSCTL_NODE(_vm_stats, OID_AUTO, page, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "VM page statistics");
 
-static counter_u64_t pqstate_commit_retries = EARLY_COUNTER;
+static COUNTER_U64_DEFINE_EARLY(pqstate_commit_retries);
 SYSCTL_COUNTER_U64(_vm_stats_page, OID_AUTO, pqstate_commit_retries,
     CTLFLAG_RD, &pqstate_commit_retries,
     "Number of failed per-page atomic queue state updates");
 
-static counter_u64_t queue_ops = EARLY_COUNTER;
+static COUNTER_U64_DEFINE_EARLY(queue_ops);
 SYSCTL_COUNTER_U64(_vm_stats_page, OID_AUTO, queue_ops,
     CTLFLAG_RD, &queue_ops,
     "Number of batched queue operations");
 
-static counter_u64_t queue_nops = EARLY_COUNTER;
+static COUNTER_U64_DEFINE_EARLY(queue_nops);
 SYSCTL_COUNTER_U64(_vm_stats_page, OID_AUTO, queue_nops,
     CTLFLAG_RD, &queue_nops,
     "Number of batched queue operations with no effects");
-
-static void
-counter_startup(void)
-{
-
-	pqstate_commit_retries = counter_u64_alloc(M_WAITOK);
-	queue_ops = counter_u64_alloc(M_WAITOK);
-	queue_nops = counter_u64_alloc(M_WAITOK);
-}
-SYSINIT(page_counters, SI_SUB_CPU, SI_ORDER_ANY, counter_startup, NULL);
 
 /*
  * bogus page -- for I/O to/from partially complete buffers,
@@ -1682,7 +1672,7 @@ vm_page_relookup(vm_object_t object, vm_pindex_t pindex)
 	vm_page_t m;
 
 	m = vm_radix_lookup_unlocked(&object->rtree, pindex);
-	KASSERT(m != NULL && vm_page_busied(m) &&
+	KASSERT(m != NULL && (vm_page_busied(m) || vm_page_wired(m)) &&
 	    m->object == object && m->pindex == pindex,
 	    ("vm_page_relookup: Invalid page %p", m));
 	return (m);
@@ -2058,8 +2048,6 @@ again:
 	if (vm_object_reserv(object) &&
 	    (m = vm_reserv_alloc_page(object, pindex, domain, req, mpred)) !=
 	    NULL) {
-		domain = vm_phys_domain(m);
-		vmd = VM_DOMAIN(domain);
 		goto found;
 	}
 #endif
@@ -2258,8 +2246,6 @@ again:
 	if (vm_object_reserv(object) &&
 	    (m_ret = vm_reserv_alloc_contig(object, pindex, domain, req,
 	    mpred, npages, low, high, alignment, boundary)) != NULL) {
-		domain = vm_phys_domain(m_ret);
-		vmd = VM_DOMAIN(domain);
 		goto found;
 	}
 #endif
@@ -4179,7 +4165,16 @@ vm_page_release_locked(vm_page_t m, int flags)
 		if ((flags & VPR_TRYFREE) != 0 &&
 		    (m->object->ref_count == 0 || !pmap_page_is_mapped(m)) &&
 		    m->dirty == 0 && vm_page_tryxbusy(m)) {
-			vm_page_free(m);
+			/*
+			 * An unlocked lookup may have wired the page before the
+			 * busy lock was acquired, in which case the page must
+			 * not be freed.
+			 */
+			if (__predict_true(!vm_page_wired(m))) {
+				vm_page_free(m);
+				return;
+			}
+			vm_page_xunbusy(m);
 		} else {
 			vm_page_release_toq(m, PQ_INACTIVE, flags != 0);
 		}
@@ -4452,7 +4447,7 @@ vm_page_acquire_unlocked(vm_object_t object, vm_pindex_t pindex,
 		 * without barriers.  Switch to radix to verify.
 		 */
 		if (prev == NULL || (m = TAILQ_NEXT(prev, listq)) == NULL ||
-		    m->pindex != pindex ||
+		    QMD_IS_TRASHED(m) || m->pindex != pindex ||
 		    atomic_load_ptr(&m->object) != object) {
 			prev = NULL;
 			/*
@@ -4535,7 +4530,8 @@ vm_page_grab_valid(vm_page_t *mp, vm_object_t object, vm_pindex_t pindex, int al
 	    (VM_ALLOC_NOWAIT | VM_ALLOC_WAITFAIL | VM_ALLOC_ZERO)) == 0,
 	    ("vm_page_grab_valid: Invalid flags 0x%X", allocflags));
 	VM_OBJECT_ASSERT_WLOCKED(object);
-	pflags = allocflags & ~(VM_ALLOC_NOBUSY | VM_ALLOC_SBUSY);
+	pflags = allocflags & ~(VM_ALLOC_NOBUSY | VM_ALLOC_SBUSY |
+	    VM_ALLOC_WIRED);
 	pflags |= VM_ALLOC_WAITFAIL;
 
 retrylookup:
@@ -5462,7 +5458,7 @@ DB_SHOW_COMMAND(pginfo, vm_page_print_pginfo)
 	else
 		m = (vm_page_t)addr;
 	db_printf(
-    "page %p obj %p pidx 0x%jx phys 0x%jx q %d ref %u\n"
+    "page %p obj %p pidx 0x%jx phys 0x%jx q %d ref 0x%x\n"
     "  af 0x%x of 0x%x f 0x%x act %d busy %x valid 0x%x dirty 0x%x\n",
 	    m, m->object, (uintmax_t)m->pindex, (uintmax_t)m->phys_addr,
 	    m->a.queue, m->ref_count, m->a.flags, m->oflags,

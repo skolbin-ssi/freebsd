@@ -1,7 +1,5 @@
 /*-
- * Copyright (c) 2016-9
- *	Netflix Inc.
- *      All rights reserved.
+ * Copyright (c) 2016-2020 Netflix, Inc.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -301,7 +299,7 @@ skip_vnet:
 			if (m->m_len < (sizeof(*ip6) + sizeof(*th))) {
 				m = m_pullup(m, sizeof(*ip6) + sizeof(*th));
 				if (m == NULL) {
-					TCPSTAT_INC(tcps_rcvshort);
+					KMOD_TCPSTAT_INC(tcps_rcvshort);
 					m_freem(m);
 					goto skipped_pkt;
 				}
@@ -320,7 +318,7 @@ skip_vnet:
 			} else
 				th->th_sum = in6_cksum(m, IPPROTO_TCP, drop_hdrlen, tlen);
 			if (th->th_sum) {
-				TCPSTAT_INC(tcps_rcvbadsum);
+				KMOD_TCPSTAT_INC(tcps_rcvbadsum);
 				m_freem(m);
 				goto skipped_pkt;
 			}
@@ -347,7 +345,7 @@ skip_vnet:
 			if (m->m_len < sizeof (struct tcpiphdr)) {
 				if ((m = m_pullup(m, sizeof (struct tcpiphdr)))
 				    == NULL) {
-					TCPSTAT_INC(tcps_rcvshort);
+					KMOD_TCPSTAT_INC(tcps_rcvshort);
 					m_freem(m);
 					goto skipped_pkt;
 				}
@@ -385,7 +383,7 @@ skip_vnet:
 				ip->ip_hl = sizeof(*ip) >> 2;
 			}
 			if (th->th_sum) {
-				TCPSTAT_INC(tcps_rcvbadsum);
+				KMOD_TCPSTAT_INC(tcps_rcvbadsum);
 				m_freem(m);
 				goto skipped_pkt;
 			}
@@ -400,7 +398,7 @@ skip_vnet:
 
 		off = th->th_off << 2;
 		if (off < sizeof (struct tcphdr) || off > tlen) {
-			TCPSTAT_INC(tcps_rcvbadoff);
+			KMOD_TCPSTAT_INC(tcps_rcvbadoff);
 				m_freem(m);
 				goto skipped_pkt;
 		}
@@ -423,6 +421,7 @@ skip_vnet:
 			nxt_pkt = 1;
 		else
 			nxt_pkt = 0;
+		KMOD_TCPSTAT_INC(tcps_rcvtotal);
 		retval = (*tp->t_fb->tfb_do_segment_nounlock)(m, th, so, tp, drop_hdrlen, tlen,
 							      iptos, nxt_pkt, &tv);
 		if (retval) {
@@ -467,7 +466,14 @@ ctf_do_queued_segments(struct socket *so, struct tcpcb *tp, int have_pkt)
 uint32_t
 ctf_outstanding(struct tcpcb *tp)
 {
-	return(tp->snd_max - tp->snd_una);
+	uint32_t bytes_out;
+
+	bytes_out = tp->snd_max - tp->snd_una;
+	if (tp->t_state < TCPS_ESTABLISHED)
+		bytes_out++;
+	if (tp->t_flags & TF_SENTFIN)
+		bytes_out++;
+	return (bytes_out);
 }
 
 uint32_t
@@ -539,11 +545,11 @@ ctf_drop_checks(struct tcpopt *to, struct mbuf *m, struct tcphdr *th, struct tcp
 			 */
 			tp->t_flags |= TF_ACKNOW;
 			todrop = tlen;
-			TCPSTAT_INC(tcps_rcvduppack);
-			TCPSTAT_ADD(tcps_rcvdupbyte, todrop);
+			KMOD_TCPSTAT_INC(tcps_rcvduppack);
+			KMOD_TCPSTAT_ADD(tcps_rcvdupbyte, todrop);
 		} else {
-			TCPSTAT_INC(tcps_rcvpartduppack);
-			TCPSTAT_ADD(tcps_rcvpartdupbyte, todrop);
+			KMOD_TCPSTAT_INC(tcps_rcvpartduppack);
+			KMOD_TCPSTAT_ADD(tcps_rcvpartdupbyte, todrop);
 		}
 		/*
 		 * DSACK - add SACK block for dropped range
@@ -573,9 +579,9 @@ ctf_drop_checks(struct tcpopt *to, struct mbuf *m, struct tcphdr *th, struct tcp
 	 */
 	todrop = (th->th_seq + tlen) - (tp->rcv_nxt + tp->rcv_wnd);
 	if (todrop > 0) {
-		TCPSTAT_INC(tcps_rcvpackafterwin);
+		KMOD_TCPSTAT_INC(tcps_rcvpackafterwin);
 		if (todrop >= tlen) {
-			TCPSTAT_ADD(tcps_rcvbyteafterwin, tlen);
+			KMOD_TCPSTAT_ADD(tcps_rcvbyteafterwin, tlen);
 			/*
 			 * If window is closed can only take segments at
 			 * window edge, and have to drop data and PUSH from
@@ -585,13 +591,13 @@ ctf_drop_checks(struct tcpopt *to, struct mbuf *m, struct tcphdr *th, struct tcp
 			 */
 			if (tp->rcv_wnd == 0 && th->th_seq == tp->rcv_nxt) {
 				tp->t_flags |= TF_ACKNOW;
-				TCPSTAT_INC(tcps_rcvwinprobe);
+				KMOD_TCPSTAT_INC(tcps_rcvwinprobe);
 			} else {
 				ctf_do_dropafterack(m, tp, th, thflags, tlen, ret_val);
 				return (1);
 			}
 		} else
-			TCPSTAT_ADD(tcps_rcvbyteafterwin, todrop);
+			KMOD_TCPSTAT_ADD(tcps_rcvbyteafterwin, todrop);
 		m_adj(m, -todrop);
 		tlen -= todrop;
 		thflags &= ~(TH_PUSH | TH_FIN);
@@ -677,7 +683,7 @@ ctf_process_rst(struct mbuf *m, struct tcphdr *th, struct socket *so, struct tcp
 		    (tp->last_ack_sent == th->th_seq) ||
 		    (tp->rcv_nxt == th->th_seq) ||
 		    ((tp->last_ack_sent - 1) == th->th_seq)) {
-			TCPSTAT_INC(tcps_drops);
+			KMOD_TCPSTAT_INC(tcps_drops);
 			/* Drop the connection. */
 			switch (tp->t_state) {
 			case TCPS_SYN_RECEIVED:
@@ -694,12 +700,13 @@ ctf_process_rst(struct mbuf *m, struct tcphdr *th, struct socket *so, struct tcp
 				tcp_state_change(tp, TCPS_CLOSED);
 				/* FALLTHROUGH */
 			default:
+				tcp_log_end_status(tp, TCP_EI_STATUS_CLIENT_RST);
 				tp = tcp_close(tp);
 			}
 			dropped = 1;
 			ctf_do_drop(m, tp);
 		} else {
-			TCPSTAT_INC(tcps_badrst);
+			KMOD_TCPSTAT_INC(tcps_badrst);
 			/* Send challenge ACK. */
 			tcp_respond(tp, mtod(m, void *), th, m,
 			    tp->rcv_nxt, tp->snd_nxt, TH_ACK);
@@ -723,7 +730,7 @@ ctf_challenge_ack(struct mbuf *m, struct tcphdr *th, struct tcpcb *tp, int32_t *
 
 	NET_EPOCH_ASSERT();
 
-	TCPSTAT_INC(tcps_badsyn);
+	KMOD_TCPSTAT_INC(tcps_badsyn);
 	if (V_tcp_insecure_syn &&
 	    SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
 	    SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) {
@@ -766,9 +773,9 @@ ctf_ts_check(struct mbuf *m, struct tcphdr *th, struct tcpcb *tp,
 		 */
 		tp->ts_recent = 0;
 	} else {
-		TCPSTAT_INC(tcps_rcvduppack);
-		TCPSTAT_ADD(tcps_rcvdupbyte, tlen);
-		TCPSTAT_INC(tcps_pawsdrop);
+		KMOD_TCPSTAT_INC(tcps_rcvduppack);
+		KMOD_TCPSTAT_ADD(tcps_rcvdupbyte, tlen);
+		KMOD_TCPSTAT_INC(tcps_pawsdrop);
 		*ret_val = 0;
 		if (tlen) {
 			ctf_do_dropafterack(m, tp, th, thflags, tlen, ret_val);
@@ -910,4 +917,25 @@ ctf_decay_count(uint32_t count, uint32_t decay)
 	 */
 	decayed_count = count - (uint32_t)perc_count;
 	return(decayed_count);
+}
+
+int32_t
+ctf_progress_timeout_check(struct tcpcb *tp, bool log)
+{
+	if (tp->t_maxunacktime && tp->t_acktime && TSTMP_GT(ticks, tp->t_acktime)) {
+		if ((ticks - tp->t_acktime) >= tp->t_maxunacktime) {
+			/*
+			 * There is an assumption that the caller
+			 * will drop the connection so we will
+			 * increment the counters here.
+			 */
+			if (log)
+				tcp_log_end_status(tp, TCP_EI_STATUS_PROGRESS);
+#ifdef NETFLIX_STATS
+			KMOD_TCPSTAT_INC(tcps_progdrops);
+#endif
+			return (1);
+		}
+	}
+	return (0);
 }

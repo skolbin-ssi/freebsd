@@ -95,6 +95,7 @@ __FBSDID("$FreeBSD$");
 #include <net/if_llatbl.h>
 #include <net/netisr.h>
 #include <net/route.h>
+#include <net/route/nhop.h>
 #include <net/pfil.h>
 #include <net/rss_config.h>
 #include <net/vnet.h>
@@ -321,7 +322,8 @@ ip6_fragment(struct ifnet *ifp, struct mbuf *m0, int hlen, u_char nextproto,
 
 static int
 ip6_output_send(struct inpcb *inp, struct ifnet *ifp, struct ifnet *origifp,
-    struct mbuf *m, struct sockaddr_in6 *dst, struct route_in6 *ro)
+    struct mbuf *m, struct sockaddr_in6 *dst, struct route_in6 *ro,
+    bool stamp_tag)
 {
 #ifdef KERN_TLS
 	struct ktls_session *tls = NULL;
@@ -340,7 +342,7 @@ ip6_output_send(struct inpcb *inp, struct ifnet *ifp, struct ifnet *origifp,
 	 * dropping the mbuf's reference) in if_output.
 	 */
 	if (m->m_next != NULL && mbuf_has_tls_session(m->m_next)) {
-		tls = ktls_hold(m->m_next->m_ext.ext_pgs->tls);
+		tls = ktls_hold(m->m_next->m_epg_tls);
 		mst = tls->snd_tag;
 
 		/*
@@ -352,6 +354,10 @@ ip6_output_send(struct inpcb *inp, struct ifnet *ifp, struct ifnet *origifp,
 			error = EAGAIN;
 			goto done;
 		}
+		/*
+		 * Always stamp tags that include NIC ktls.
+		 */
+		stamp_tag = true;
 	}
 #endif
 #ifdef RATELIMIT
@@ -365,7 +371,7 @@ ip6_output_send(struct inpcb *inp, struct ifnet *ifp, struct ifnet *origifp,
 			mst = inp->inp_snd_tag;
 	}
 #endif
-	if (mst != NULL) {
+	if (stamp_tag && mst != NULL) {
 		KASSERT(m->m_pkthdr.rcvif == NULL,
 		    ("trying to add a send tag to a forwarded packet"));
 		if (mst->ifp != ifp) {
@@ -403,9 +409,9 @@ done:
  * This function may modify ver and hlim only.
  * The mbuf chain containing the packet will be freed.
  * The mbuf opt, if present, will not be freed.
- * If route_in6 ro is present and has ro_rt initialized, route lookup would be
- * skipped and ro->ro_rt would be used. If ro is present but ro->ro_rt is NULL,
- * then result of route lookup is stored in ro->ro_rt.
+ * If route_in6 ro is present and has ro_nh initialized, route lookup would be
+ * skipped and ro->ro_nh would be used. If ro is present but ro->ro_nh is NULL,
+ * then result of route lookup is stored in ro->ro_nh.
  *
  * Type of "mtu": rt_mtu is u_long, ifnet.ifr_mtu is int, and nd_ifinfo.linkmtu
  * is uint32_t.  So we use u_long to hold largest one, which is rt_mtu.
@@ -424,12 +430,12 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
 	struct ifnet *ifp, *origifp;
 	struct mbuf *m = m0;
 	struct mbuf *mprev;
-	int tlen, len;
-	struct route_in6 ip6route;
-	struct rtentry *rt = NULL;
-	struct sockaddr_in6 *dst, src_sa, dst_sa;
+	struct route_in6 *ro_pmtu;
+	struct nhop_object *nh;
+	struct sockaddr_in6 *dst, sin6, src_sa, dst_sa;
 	struct in6_addr odst;
 	u_char *nexthdrp;
+	int tlen, len;
 	int error = 0;
 	struct in6_ifaddr *ia = NULL;
 	u_long mtu;
@@ -438,7 +444,6 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
 	struct ip6_exthdrs exthdrs;
 	struct in6_addr src0, dst0;
 	u_int32_t zone;
-	struct route_in6 *ro_pmtu = NULL;
 	bool hdrsplit;
 	int sw_csum, tso;
 	int needfiblookup;
@@ -631,15 +636,15 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt,
 	IP6STAT_INC(ip6s_localout);
 
 	/* Route packet. */
-	if (ro == NULL) {
-		ro = &ip6route;
-		bzero((caddr_t)ro, sizeof(*ro));
-	}
 	ro_pmtu = ro;
 	if (opt && opt->ip6po_rthdr)
 		ro = &opt->ip6po_route;
-	dst = (struct sockaddr_in6 *)&ro->ro_dst;
+	if (ro != NULL)
+		dst = (struct sockaddr_in6 *)&ro->ro_dst;
+	else
+		dst = &sin6;
 	fibnum = (inp != NULL) ? inp->inp_inc.inc_fibnum : M_GETFIB(m);
+
 again:
 	/*
 	 * If specified, try to fill in the traffic class field.
@@ -666,54 +671,123 @@ again:
 		else
 			ip6->ip6_hlim = V_ip6_defmcasthlim;
 	}
+
+	if (ro == NULL || ro->ro_nh == NULL) {
+		bzero(dst, sizeof(*dst));
+		dst->sin6_family = AF_INET6;
+		dst->sin6_len = sizeof(*dst);
+		dst->sin6_addr = ip6->ip6_dst;
+	} 
 	/*
-	 * Validate route against routing table additions;
-	 * a better/more specific route might have been added.
+	 * Validate route against routing table changes.
 	 * Make sure that the address family is set in route.
 	 */
-	if (inp) {
-		ro->ro_dst.sin6_family = AF_INET6;
-		RT_VALIDATE((struct route *)ro, &inp->inp_rt_cookie, fibnum);
-	}
-	if (ro->ro_rt && fwd_tag == NULL && (ro->ro_rt->rt_flags & RTF_UP) &&
-	    ro->ro_dst.sin6_family == AF_INET6 &&
-	    IN6_ARE_ADDR_EQUAL(&ro->ro_dst.sin6_addr, &ip6->ip6_dst)) {
-		rt = ro->ro_rt;
-		ifp = ro->ro_rt->rt_ifp;
+	nh = NULL;
+	ifp = NULL;
+	mtu = 0;
+	if (ro != NULL) {
+		if (ro->ro_nh != NULL && inp != NULL) {
+			ro->ro_dst.sin6_family = AF_INET6; /* XXX KASSERT? */
+			NH_VALIDATE((struct route *)ro, &inp->inp_rt_cookie,
+			    fibnum);
+		}
+		if (ro->ro_nh != NULL && fwd_tag == NULL &&
+		    (!NH_IS_VALID(ro->ro_nh) ||
+		    ro->ro_dst.sin6_family != AF_INET6 ||
+		    !IN6_ARE_ADDR_EQUAL(&ro->ro_dst.sin6_addr, &ip6->ip6_dst)))
+			RO_INVALIDATE_CACHE(ro);
+
+		if (ro->ro_nh != NULL && fwd_tag == NULL &&
+		    ro->ro_dst.sin6_family == AF_INET6 &&
+		    IN6_ARE_ADDR_EQUAL(&ro->ro_dst.sin6_addr, &ip6->ip6_dst)) {
+			nh = ro->ro_nh;
+			ifp = nh->nh_ifp;
+		} else {
+			if (ro->ro_lle)
+				LLE_FREE(ro->ro_lle);	/* zeros ro_lle */
+			ro->ro_lle = NULL;
+			if (fwd_tag == NULL) {
+				bzero(&dst_sa, sizeof(dst_sa));
+				dst_sa.sin6_family = AF_INET6;
+				dst_sa.sin6_len = sizeof(dst_sa);
+				dst_sa.sin6_addr = ip6->ip6_dst;
+			}
+			error = in6_selectroute(&dst_sa, opt, im6o, ro, &ifp,
+			    &nh, fibnum, m->m_pkthdr.flowid);
+			if (error != 0) {
+				IP6STAT_INC(ip6s_noroute);
+				if (ifp != NULL)
+					in6_ifstat_inc(ifp, ifs6_out_discard);
+				goto bad;
+			}
+			if (ifp != NULL)
+			    mtu = ifp->if_mtu;
+		}
+		if (nh == NULL) {
+			/*
+			 * If in6_selectroute() does not return a nexthop
+			 * dst may not have been updated.
+			 */
+			*dst = dst_sa;	/* XXX */
+		} else {
+			if (nh->nh_flags & NHF_HOST)
+			    mtu = nh->nh_mtu;
+			ia = (struct in6_ifaddr *)(nh->nh_ifa);
+			counter_u64_add(nh->nh_pksent, 1);
+		}
 	} else {
-		if (ro->ro_lle)
-			LLE_FREE(ro->ro_lle);	/* zeros ro_lle */
-		ro->ro_lle = NULL;
+		struct nhop6_extended nh6;
+		struct in6_addr kdst;
+		uint32_t scopeid;
+
 		if (fwd_tag == NULL) {
 			bzero(&dst_sa, sizeof(dst_sa));
 			dst_sa.sin6_family = AF_INET6;
 			dst_sa.sin6_len = sizeof(dst_sa);
 			dst_sa.sin6_addr = ip6->ip6_dst;
 		}
-		error = in6_selectroute_fib(&dst_sa, opt, im6o, ro, &ifp,
-		    &rt, fibnum);
+
+		if (IN6_IS_ADDR_MULTICAST(&dst_sa.sin6_addr) &&
+		    im6o != NULL &&
+		    (ifp = im6o->im6o_multicast_ifp) != NULL) {
+			/* We do not need a route lookup. */
+			*dst = dst_sa;	/* XXX */
+			goto nonh6lookup;
+		}
+
+		in6_splitscope(&dst_sa.sin6_addr, &kdst, &scopeid);
+
+		if (IN6_IS_ADDR_MC_LINKLOCAL(&dst_sa.sin6_addr) ||
+		    IN6_IS_ADDR_MC_NODELOCAL(&dst_sa.sin6_addr)) {
+			if (scopeid > 0) {
+				ifp = in6_getlinkifnet(scopeid);
+				*dst = dst_sa;	/* XXX */
+				goto nonh6lookup;
+			}
+		}
+
+		error = fib6_lookup_nh_ext(fibnum, &kdst, scopeid, NHR_REF, 0,
+		    &nh6);
 		if (error != 0) {
-			if (ifp != NULL)
-				in6_ifstat_inc(ifp, ifs6_out_discard);
+			IP6STAT_INC(ip6s_noroute);
+			/* No ifp in6_ifstat_inc(ifp, ifs6_out_discard); */
+			error = EHOSTUNREACH;;
 			goto bad;
 		}
-	}
-	if (rt == NULL) {
-		/*
-		 * If in6_selectroute() does not return a route entry
-		 * dst may not have been updated.
-		 */
-		*dst = dst_sa;	/* XXX */
+
+		ifp = nh6.nh_ifp;
+		mtu = nh6.nh_mtu;
+		dst->sin6_addr = nh6.nh_addr;
+		ia = nh6.nh_ia;
+		fib6_free_nh_ext(fibnum, &nh6);
+nonh6lookup:
+		;
 	}
 
-	/* Then rt (for unicast) and ifp must be non-NULL valid values. */
+	/* Then nh (for unicast) and ifp must be non-NULL valid values. */
 	if ((flags & IPV6_FORWARDING) == 0) {
 		/* XXX: the FORWARDING flag can be set for mrouting. */
 		in6_ifstat_inc(ifp, ifs6_out_request);
-	}
-	if (rt != NULL) {
-		ia = (struct in6_ifaddr *)(rt->rt_ifa);
-		counter_u64_add(rt->rt_pksent, 1);
 	}
 
 	/* Setup data structures for scope ID checks. */
@@ -781,8 +855,8 @@ again:
 	}
 	/* All scope ID checks are successful. */
 
-	if (rt && !IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
-		if (opt && opt->ip6po_nextroute.ro_rt) {
+	if (nh && !IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
+		if (opt && opt->ip6po_nextroute.ro_nh) {
 			/*
 			 * The nexthop is explicitly specified by the
 			 * application.  We assume the next hop is an IPv6
@@ -790,8 +864,8 @@ again:
 			 */
 			dst = (struct sockaddr_in6 *)opt->ip6po_nexthop;
 		}
-		else if ((rt->rt_flags & RTF_GATEWAY))
-			dst = (struct sockaddr_in6 *)rt->rt_gateway;
+		else if ((nh->nh_flags & NHF_GATEWAY))
+			dst = &nh->gw6_sa;
 	}
 
 	if (!IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
@@ -869,6 +943,9 @@ again:
 	if ((error = ip6_getpmtu(ro_pmtu, ro != ro_pmtu, ifp, &ip6->ip6_dst,
 		    &mtu, &alwaysfrag, fibnum, *nexthdrp)) != 0)
 		goto bad;
+	KASSERT(mtu > 0, ("%s:%d: mtu %ld, ro_pmtu %p ro %p ifp %p "
+	    "alwaysfrag %d fibnum %u\n", __func__, __LINE__, mtu, ro_pmtu, ro,
+	    ifp, alwaysfrag, fibnum));
 
 	/*
 	 * The caller of this function may specify to use the minimum MTU
@@ -972,7 +1049,8 @@ again:
 			error = netisr_queue(NETISR_IPV6, m);
 			goto done;
 		} else {
-			RO_INVALIDATE_CACHE(ro);
+			if (ro != NULL)
+				RO_INVALIDATE_CACHE(ro);
 			needfiblookup = 1; /* Redo the routing table lookup. */
 		}
 	}
@@ -980,7 +1058,8 @@ again:
 	if (fibnum != M_GETFIB(m)) {
 		m->m_flags |= M_SKIP_FIREWALL;
 		fibnum = M_GETFIB(m);
-		RO_INVALIDATE_CACHE(ro);
+		if (ro != NULL)
+			RO_INVALIDATE_CACHE(ro);
 		needfiblookup = 1;
 	}
 	if (needfiblookup)
@@ -1005,7 +1084,10 @@ again:
 	/* Or forward to some other address? */
 	if ((m->m_flags & M_IP6_NEXTHOP) &&
 	    (fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL)) != NULL) {
-		dst = (struct sockaddr_in6 *)&ro->ro_dst;
+		if (ro != NULL)
+			dst = (struct sockaddr_in6 *)&ro->ro_dst;
+		else
+			dst = &sin6;
 		bcopy((fwd_tag+1), &dst_sa, sizeof(struct sockaddr_in6));
 		m->m_flags |= M_SKIP_FIREWALL;
 		m->m_flags &= ~M_IP6_NEXTHOP;
@@ -1088,7 +1170,8 @@ passout:
 			    m->m_pkthdr.len);
 			ifa_free(&ia6->ia_ifa);
 		}
-		error = ip6_output_send(inp, ifp, origifp, m, dst, ro);
+		error = ip6_output_send(inp, ifp, origifp, m, dst, ro,
+		    (flags & IP_NO_SND_TAG_RL) ? false : true);
 		goto done;
 	}
 
@@ -1179,7 +1262,8 @@ sendorfree:
 				counter_u64_add(ia->ia_ifa.ifa_obytes,
 				    m->m_pkthdr.len);
 			}
-			error = ip6_output_send(inp, ifp, origifp, m, dst, ro);
+			error = ip6_output_send(inp, ifp, origifp, m, dst, ro,
+			    true);
 		} else
 			m_freem(m);
 	}
@@ -1188,8 +1272,6 @@ sendorfree:
 		IP6STAT_INC(ip6s_fragmented);
 
 done:
-	if (ro == &ip6route)
-		RO_RTFREE(ro);
 	return (error);
 
 freehdrs:
@@ -1405,22 +1487,25 @@ ip6_getpmtu(struct route_in6 *ro_pmtu, int do_lookup,
 	struct nhop6_basic nh6;
 	struct in6_addr kdst;
 	uint32_t scopeid;
-	struct sockaddr_in6 *sa6_dst;
+	struct sockaddr_in6 *sa6_dst, sin6;
 	u_long mtu;
 
 	mtu = 0;
-	if (do_lookup) {
+	if (ro_pmtu == NULL || do_lookup) {
 
 		/*
 		 * Here ro_pmtu has final destination address, while
 		 * ro might represent immediate destination.
 		 * Use ro_pmtu destination since mtu might differ.
 		 */
-		sa6_dst = (struct sockaddr_in6 *)&ro_pmtu->ro_dst;
-		if (!IN6_ARE_ADDR_EQUAL(&sa6_dst->sin6_addr, dst))
-			ro_pmtu->ro_mtu = 0;
+		if (ro_pmtu != NULL) {
+			sa6_dst = (struct sockaddr_in6 *)&ro_pmtu->ro_dst;
+			if (!IN6_ARE_ADDR_EQUAL(&sa6_dst->sin6_addr, dst))
+				ro_pmtu->ro_mtu = 0;
+		} else
+			sa6_dst = &sin6;
 
-		if (ro_pmtu->ro_mtu == 0) {
+		if (ro_pmtu == NULL || ro_pmtu->ro_mtu == 0) {
 			bzero(sa6_dst, sizeof(*sa6_dst));
 			sa6_dst->sin6_family = AF_INET6;
 			sa6_dst->sin6_len = sizeof(struct sockaddr_in6);
@@ -1428,15 +1513,17 @@ ip6_getpmtu(struct route_in6 *ro_pmtu, int do_lookup,
 
 			in6_splitscope(dst, &kdst, &scopeid);
 			if (fib6_lookup_nh_basic(fibnum, &kdst, scopeid, 0, 0,
-			    &nh6) == 0)
-				ro_pmtu->ro_mtu = nh6.nh_mtu;
-		}
-
-		mtu = ro_pmtu->ro_mtu;
+			    &nh6) == 0) {
+				mtu = nh6.nh_mtu;
+				if (ro_pmtu != NULL)
+					ro_pmtu->ro_mtu = mtu;
+			}
+		} else
+			mtu = ro_pmtu->ro_mtu;
 	}
 
-	if (ro_pmtu->ro_rt)
-		mtu = ro_pmtu->ro_rt->rt_mtu;
+	if (ro_pmtu != NULL && ro_pmtu->ro_nh != NULL)
+		mtu = ro_pmtu->ro_nh->nh_mtu;
 
 	return (ip6_calcmtu(ifp, dst, mtu, mtup, alwaysfragp, proto));
 }
@@ -1612,8 +1699,10 @@ ip6_ctloutput(struct socket *so, struct sockopt *sopt)
 				error = soopt_mcopyin(sopt, m); /* XXX */
 				if (error != 0)
 					break;
-				error = ip6_pcbopts(&inp->in6p_outputopts,
-						    m, so, sopt);
+				INP_WLOCK(inp);
+				error = ip6_pcbopts(&inp->in6p_outputopts, m,
+				    so, sopt);
+				INP_WUNLOCK(inp);
 				m_freem(m); /* XXX */
 				break;
 			}
@@ -2376,8 +2465,11 @@ ip6_pcbopts(struct ip6_pktopts **pktopt, struct mbuf *m,
 			printf("ip6_pcbopts: all specified options are cleared.\n");
 #endif
 		ip6_clearpktopts(opt, -1);
-	} else
-		opt = malloc(sizeof(*opt), M_IP6OPT, M_WAITOK);
+	} else {
+		opt = malloc(sizeof(*opt), M_IP6OPT, M_NOWAIT);
+		if (opt == NULL)
+			return (ENOMEM);
+	}
 	*pktopt = NULL;
 
 	if (!m || m->m_len == 0) {
@@ -2564,9 +2656,9 @@ ip6_clearpktopts(struct ip6_pktopts *pktopt, int optname)
 	if (optname == -1 || optname == IPV6_TCLASS)
 		pktopt->ip6po_tclass = -1;
 	if (optname == -1 || optname == IPV6_NEXTHOP) {
-		if (pktopt->ip6po_nextroute.ro_rt) {
-			RTFREE(pktopt->ip6po_nextroute.ro_rt);
-			pktopt->ip6po_nextroute.ro_rt = NULL;
+		if (pktopt->ip6po_nextroute.ro_nh) {
+			NH_FREE(pktopt->ip6po_nextroute.ro_nh);
+			pktopt->ip6po_nextroute.ro_nh = NULL;
 		}
 		if (pktopt->ip6po_nexthop)
 			free(pktopt->ip6po_nexthop, M_IP6OPT);
@@ -2586,9 +2678,9 @@ ip6_clearpktopts(struct ip6_pktopts *pktopt, int optname)
 		if (pktopt->ip6po_rhinfo.ip6po_rhi_rthdr)
 			free(pktopt->ip6po_rhinfo.ip6po_rhi_rthdr, M_IP6OPT);
 		pktopt->ip6po_rhinfo.ip6po_rhi_rthdr = NULL;
-		if (pktopt->ip6po_route.ro_rt) {
-			RTFREE(pktopt->ip6po_route.ro_rt);
-			pktopt->ip6po_route.ro_rt = NULL;
+		if (pktopt->ip6po_route.ro_nh) {
+			NH_FREE(pktopt->ip6po_route.ro_nh);
+			pktopt->ip6po_route.ro_nh = NULL;
 		}
 	}
 	if (optname == -1 || optname == IPV6_DSTOPTS) {

@@ -227,7 +227,7 @@ SHLIB_NAME_FULL=${SHLIB_NAME}
 
 # Allow libraries to specify their own version map or have it
 # automatically generated (see bsd.symver.mk above).
-.if ${MK_SYMVER} == "yes" && !empty(VERSION_MAP)
+.if !empty(VERSION_MAP)
 ${SHLIB_NAME_FULL}:	${VERSION_MAP}
 LDFLAGS+=	-Wl,--version-script=${VERSION_MAP}
 .endif
@@ -489,7 +489,10 @@ _libinstall:
 .include <bsd.nls.mk>
 .include <bsd.confs.mk>
 .include <bsd.files.mk>
+#No need to install header for INTERNALLIB
+.if !defined(INTERNALLIB)
 .include <bsd.incs.mk>
+.endif
 .endif
 
 LINKOWN?=	${LIBOWN}

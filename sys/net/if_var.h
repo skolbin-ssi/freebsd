@@ -44,7 +44,7 @@
  * received from its medium.
  *
  * Output occurs when the routine if_output is called, with three parameters:
- *	(*ifp->if_output)(ifp, m, dst, rt)
+ *	(*ifp->if_output)(ifp, m, dst, ro)
  * Here m is the mbuf chain to be sent and dst is the destination address.
  * The output routine encapsulates the supplied datagram if necessary,
  * and then transmits it on its medium.
@@ -61,6 +61,7 @@
  */
 
 struct	rtentry;		/* ifa_rtrequest */
+struct	nhop_object;		/* ifa_rtrequest */
 struct	rt_addrinfo;		/* ifa_rtrequest */
 struct	socket;
 struct	carp_if;
@@ -198,6 +199,7 @@ struct if_snd_tag_alloc_header {
 	uint32_t type;		/* send tag type, see IF_SND_TAG_XXX */
 	uint32_t flowid;	/* mbuf hash value */
 	uint32_t flowtype;	/* mbuf hash type */
+	uint8_t numa_domain;	/* numa domain of associated inp */
 };
 
 struct if_snd_tag_alloc_rate_limit {
@@ -550,7 +552,8 @@ struct ifaddr {
 	struct	carp_softc *ifa_carp;	/* pointer to CARP data */
 	CK_STAILQ_ENTRY(ifaddr) ifa_link;	/* queue macro glue */
 	void	(*ifa_rtrequest)	/* check or clean routes (+ or -)'d */
-		(int, struct rtentry *, struct rt_addrinfo *);
+		(int, struct rtentry *, struct nhop_object *,
+		 struct rt_addrinfo *);
 	u_short	ifa_flags;		/* mostly rt_flags for cloning */
 #define	IFA_ROUTE	RTF_UP		/* route installed */
 #define	IFA_RTSELF	RTF_HOST	/* loopback route to self installed */
@@ -784,6 +787,8 @@ int if_hw_tsomax_update(if_t ifp, struct ifnet_hw_tsomax *);
 
 /* accessors for struct ifreq */
 void *ifr_data_get_ptr(void *ifrp);
+void *ifr_buffer_get_buffer(void *data);
+size_t ifr_buffer_get_length(void *data);
 
 int ifhwioctl(u_long, struct ifnet *, caddr_t, struct thread *);
 
