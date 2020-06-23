@@ -167,7 +167,8 @@ aesni_attach(device_t dev)
 	sc = device_get_softc(dev);
 
 	sc->cid = crypto_get_driverid(dev, sizeof(struct aesni_session),
-	    CRYPTOCAP_F_SOFTWARE | CRYPTOCAP_F_SYNC);
+	    CRYPTOCAP_F_SOFTWARE | CRYPTOCAP_F_SYNC |
+	    CRYPTOCAP_F_ACCEL_SOFTWARE);
 	if (sc->cid < 0) {
 		device_printf(dev, "Could not get crypto driver id.\n");
 		return (ENOMEM);
@@ -253,7 +254,8 @@ aesni_probesession(device_t dev, const struct crypto_session_params *csp)
 	struct aesni_softc *sc;
 
 	sc = device_get_softc(dev);
-	if ((csp->csp_flags & ~(CSP_F_SEPARATE_OUTPUT)) != 0)
+	if ((csp->csp_flags & ~(CSP_F_SEPARATE_OUTPUT | CSP_F_SEPARATE_AAD)) !=
+	    0)
 		return (EINVAL);
 	switch (csp->csp_mode) {
 	case CSP_MODE_DIGEST:
@@ -387,7 +389,7 @@ MODULE_VERSION(aesni, 1);
 MODULE_DEPEND(aesni, crypto, 1, 1, 1);
 
 static int
-intel_sha1_update(void *vctx, void *vdata, u_int datalen)
+intel_sha1_update(void *vctx, const void *vdata, u_int datalen)
 {
 	struct sha1_ctxt *ctx = vctx;
 	const char *data = vdata;
@@ -436,7 +438,7 @@ SHA1_Finalize_fn(void *digest, void *ctx)
 }
 
 static int
-intel_sha256_update(void *vctx, void *vdata, u_int len)
+intel_sha256_update(void *vctx, const void *vdata, u_int len)
 {
 	SHA256_CTX *ctx = vctx;
 	uint64_t bitlen;
@@ -696,8 +698,11 @@ aesni_cipher_crypt(struct aesni_session *ses, struct cryptop *crp,
 	authbuf = NULL;
 	if (csp->csp_cipher_alg == CRYPTO_AES_NIST_GCM_16 ||
 	    csp->csp_cipher_alg == CRYPTO_AES_CCM_16) {
-		authbuf = aesni_cipher_alloc(crp, crp->crp_aad_start,
-		    crp->crp_aad_length, &authallocated);
+		if (crp->crp_aad != NULL)
+			authbuf = crp->crp_aad;
+		else
+			authbuf = aesni_cipher_alloc(crp, crp->crp_aad_start,
+			    crp->crp_aad_length, &authallocated);
 		if (authbuf == NULL) {
 			error = ENOMEM;
 			goto out;
@@ -815,6 +820,8 @@ out:
 		explicit_bzero(outbuf, crp->crp_payload_length);
 		free(outbuf, M_AESNI);
 	}
+	explicit_bzero(iv, sizeof(iv));
+	explicit_bzero(tag, sizeof(tag));
 	return (error);
 }
 
@@ -826,9 +833,7 @@ aesni_cipher_mac(struct aesni_session *ses, struct cryptop *crp,
 		struct SHA256Context sha2 __aligned(16);
 		struct sha1_ctxt sha1 __aligned(16);
 	} sctx;
-	uint8_t hmac_key[SHA1_BLOCK_LEN] __aligned(16);
 	uint32_t res[SHA2_256_HASH_LEN / sizeof(uint32_t)];
-	uint32_t res2[SHA2_256_HASH_LEN / sizeof(uint32_t)];
 	const uint8_t *key;
 	int i, keylen;
 
@@ -839,6 +844,8 @@ aesni_cipher_mac(struct aesni_session *ses, struct cryptop *crp,
 	keylen = csp->csp_auth_klen;
 
 	if (ses->hmac) {
+		uint8_t hmac_key[SHA1_BLOCK_LEN] __aligned(16);
+
 		/* Inner hash: (K ^ IPAD) || data */
 		ses->hash_init(&sctx);
 		for (i = 0; i < keylen; i++)
@@ -847,8 +854,12 @@ aesni_cipher_mac(struct aesni_session *ses, struct cryptop *crp,
 			hmac_key[i] = 0 ^ HMAC_IPAD_VAL;
 		ses->hash_update(&sctx, hmac_key, sizeof(hmac_key));
 
-		crypto_apply(crp, crp->crp_aad_start, crp->crp_aad_length,
-		    ses->hash_update, &sctx);
+		if (crp->crp_aad != NULL)
+			ses->hash_update(&sctx, crp->crp_aad,
+			    crp->crp_aad_length);
+		else
+			crypto_apply(crp, crp->crp_aad_start,
+			    crp->crp_aad_length, ses->hash_update, &sctx);
 		if (CRYPTO_HAS_OUTPUT_BUFFER(crp) &&
 		    CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
 			crypto_apply_buf(&crp->crp_obuf,
@@ -869,11 +880,16 @@ aesni_cipher_mac(struct aesni_session *ses, struct cryptop *crp,
 		ses->hash_update(&sctx, hmac_key, sizeof(hmac_key));
 		ses->hash_update(&sctx, res, ses->hash_len);
 		ses->hash_finalize(res, &sctx);
+		explicit_bzero(hmac_key, sizeof(hmac_key));
 	} else {
 		ses->hash_init(&sctx);
 
-		crypto_apply(crp, crp->crp_aad_start, crp->crp_aad_length,
-		    ses->hash_update, &sctx);
+		if (crp->crp_aad != NULL)
+			ses->hash_update(&sctx, crp->crp_aad,
+			    crp->crp_aad_length);
+		else
+			crypto_apply(crp, crp->crp_aad_start,
+			    crp->crp_aad_length, ses->hash_update, &sctx);
 		if (CRYPTO_HAS_OUTPUT_BUFFER(crp) &&
 		    CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
 			crypto_apply_buf(&crp->crp_obuf,
@@ -889,10 +905,14 @@ aesni_cipher_mac(struct aesni_session *ses, struct cryptop *crp,
 	}
 
 	if (crp->crp_op & CRYPTO_OP_VERIFY_DIGEST) {
+		uint32_t res2[SHA2_256_HASH_LEN / sizeof(uint32_t)];
+
 		crypto_copydata(crp, crp->crp_digest_start, ses->mlen, res2);
 		if (timingsafe_bcmp(res, res2, ses->mlen) != 0)
 			return (EBADMSG);
+		explicit_bzero(res2, sizeof(res2));
 	} else
 		crypto_copyback(crp, crp->crp_digest_start, ses->mlen, res);
+	explicit_bzero(res, sizeof(res));
 	return (0);
 }

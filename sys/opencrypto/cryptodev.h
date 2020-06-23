@@ -384,6 +384,7 @@ struct crypto_session_params {
 	int		csp_flags;
 
 #define	CSP_F_SEPARATE_OUTPUT	0x0001	/* Requests can use separate output */
+#define	CSP_F_SEPARATE_AAD	0x0002	/* Requests can use separate AAD */
 
 	int		csp_ivlen;	/* IV length in bytes. */
 
@@ -479,6 +480,7 @@ struct cryptop {
 	struct crypto_buffer crp_buf;
 	struct crypto_buffer crp_obuf;
 
+	void		*crp_aad;	/* AAD buffer. */
 	int		crp_aad_start;	/* Location of AAD. */
 	int		crp_aad_length;	/* 0 => no AAD. */
 	int		crp_iv_start;	/* Location of IV.  IV length is from
@@ -620,6 +622,7 @@ extern	void crypto_freesession(crypto_session_t cses);
 #define	CRYPTOCAP_F_HARDWARE	CRYPTO_FLAG_HARDWARE
 #define	CRYPTOCAP_F_SOFTWARE	CRYPTO_FLAG_SOFTWARE
 #define	CRYPTOCAP_F_SYNC	0x04000000	/* operates synchronously */
+#define	CRYPTOCAP_F_ACCEL_SOFTWARE 0x08000000
 extern	int32_t crypto_get_driverid(device_t dev, size_t session_size,
     int flags);
 extern	int crypto_find_driver(const char *);
@@ -667,12 +670,12 @@ void	crypto_copyback(struct cryptop *crp, int off, int size,
 	    const void *src);
 void	crypto_copydata(struct cryptop *crp, int off, int size, void *dst);
 int	crypto_apply(struct cryptop *crp, int off, int len,
-	    int (*f)(void *, void *, u_int), void *arg);
+	    int (*f)(void *, const void *, u_int), void *arg);
 void	*crypto_contiguous_subsegment(struct cryptop *crp, size_t skip,
 	    size_t len);
 
 int	crypto_apply_buf(struct crypto_buffer *cb, int off, int len,
-	    int (*f)(void *, void *, u_int), void *arg);
+	    int (*f)(void *, const void *, u_int), void *arg);
 void	*crypto_buffer_contiguous_subsegment(struct crypto_buffer *cb,
 	    size_t skip, size_t len);
 size_t	crypto_buffer_len(struct crypto_buffer *cb);
