@@ -105,6 +105,7 @@ __DEFAULT_YES_OPTIONS = \
     FTP \
     GAMES \
     GDB \
+    GH_BC \
     GNU_DIFF \
     GNU_GREP \
     GOOGLETEST \
@@ -317,8 +318,8 @@ BROKEN_OPTIONS+=LIBSOFT
 # marked no longer broken with the switch to LLVM.
 BROKEN_OPTIONS+=GOOGLETEST SSP
 .endif
-# EFI doesn't exist on mips, powerpc, or riscv.
-.if ${__T:Mmips*} || ${__T:Mpowerpc*} || ${__T:Mriscv*}
+# EFI doesn't exist on mips or powerpc.
+.if ${__T:Mmips*} || ${__T:Mpowerpc*}
 BROKEN_OPTIONS+=EFI
 .endif
 # OFW is only for powerpc, exclude others
