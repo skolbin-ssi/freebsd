@@ -213,6 +213,7 @@ __DEFAULT_NO_OPTIONS = \
     LOADER_FORCE_LE \
     LOADER_VERBOSE \
     LOADER_VERIEXEC_PASS_MANIFEST \
+    MALLOC_PRODUCTION \
     OFED_EXTRA \
     OPENLDAP \
     REPRODUCIBLE_BUILD \
@@ -359,10 +360,19 @@ BROKEN_OPTIONS+=HYPERV
 BROKEN_OPTIONS+=NVME
 .endif
 
-.if ${__T} == "amd64" || ${__T} == "i386" || ${__T} == "powerpc64"
+.if ${__T} == "aarch64" || ${__T} == "amd64" || ${__T} == "i386" || \
+    ${__T} == "powerpc64"
 __DEFAULT_YES_OPTIONS+=OPENMP
 .else
 __DEFAULT_NO_OPTIONS+=OPENMP
+.endif
+
+.if ${.MAKE.OS} != "FreeBSD"
+# Building the target compiler requires building tablegen on the host
+# which is (currently) not possible on non-FreeBSD.
+BROKEN_OPTIONS+=CLANG LLD LLDB
+# The same also applies to the bootstrap LLVM.
+BROKEN_OPTIONS+=CLANG_BOOTSTRAP LLD_BOOTSTRAP
 .endif
 
 .include <bsd.mkopt.mk>

@@ -188,6 +188,10 @@ cpu_mp_start(void)
 	setidt(IPI_SUSPEND, IDTVEC(cpususpend),
 	       SDT_SYS386IGT, SEL_KPL, GSEL(GCODE_SEL, SEL_KPL));
 
+	/* Install an IPI for calling delayed SWI */
+	setidt(IPI_SWI, IDTVEC(ipi_swi),
+	       SDT_SYS386IGT, SEL_KPL, GSEL(GCODE_SEL, SEL_KPL));
+
 	/* Set boot_cpu_id if needed. */
 	if (boot_cpu_id == -1) {
 		boot_cpu_id = PCPU_GET(apic_id);
@@ -285,7 +289,7 @@ init_secondary(void)
 	cr0 &= ~(CR0_CD | CR0_NW | CR0_EM);
 	load_cr0(cr0);
 	CHECK_WRITE(0x38, 5);
-	
+
 	/* signal our startup to the BSP. */
 	mp_naps++;
 	CHECK_WRITE(0x39, 6);

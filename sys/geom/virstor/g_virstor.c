@@ -227,7 +227,7 @@ virstor_ctl_stop(struct gctl_req *req, struct g_class *cp)
 		struct g_virstor_softc *sc;
 		int error;
 
-		sprintf(param, "arg%d", i);
+		snprintf(param, sizeof(param), "arg%d", i);
 		name = gctl_get_asciiparam(req, param);
 		if (name == NULL) {
 			gctl_error(req, "No 'arg%d' argument", i);
@@ -397,7 +397,6 @@ virstor_ctl_add(struct gctl_req *req, struct g_class *cp)
 		 * incremented */
 		sc->n_components++;
 		added++;
-
 	}
 	/* This call to update_metadata() is critical. In case there's a
 	 * power failure in the middle of it and some components are updated
@@ -565,7 +564,7 @@ virstor_ctl_remove(struct gctl_req *req, struct g_class *cp)
 		int j, found;
 		struct g_virstor_component *newcomp, *compbak;
 
-		sprintf(param, "arg%d", i);
+		snprintf(param, sizeof(param), "arg%d", i);
 		prov_name = gctl_get_asciiparam(req, param);
 		if (prov_name == NULL) {
 			gctl_error(req, "Error fetching argument '%s'", param);
@@ -683,7 +682,7 @@ g_virstor_destroy_geom(struct gctl_req *req __unused, struct g_class *mp,
 
 	sc = gp->softc;
 	KASSERT(sc != NULL, ("%s: NULL sc", __func__));
-	
+
 	exitval = 0;
 	LOG_MSG(LVL_DEBUG, "%s called for %s, sc=%p", __func__, gp->name,
 	    gp->softc);

@@ -75,7 +75,6 @@ __FBSDID("$FreeBSD$");
 #include <cam/cam_xpt_internal.h>
 #include <cam/cam_debug.h>
 
-
 #include <cam/mmc/mmc_all.h>
 
 #ifdef _KERNEL
@@ -268,7 +267,6 @@ mmc_handle_reply(union ccb *ccb)
 	return (0); /* Normal return */
 }
 
-
 static uint32_t
 mmc_get_bits(uint32_t *bits, int bit_len, int start, int size)
 {
@@ -279,7 +277,6 @@ mmc_get_bits(uint32_t *bits, int bit_len, int start, int size)
 		retval |= bits[i - 1] << (32 - shift);
 	return (retval & ((1llu << size) - 1));
 }
-
 
 static void
 mmc_decode_csd_sd(uint32_t *raw_csd, struct mmc_csd *csd)
@@ -752,7 +749,6 @@ sddaasync(void *callback_arg, u_int32_t code,
 	}
 }
 
-
 static int
 sddagetattr(struct bio *bp)
 {
@@ -789,7 +785,6 @@ sddaregister(struct cam_periph *periph, void *arg)
 
 	softc = (struct sdda_softc *)malloc(sizeof(*softc), M_DEVBUF,
 	    M_NOWAIT|M_ZERO);
-
 	if (softc == NULL) {
 		printf("sddaregister: Unable to probe new device. "
 		    "Unable to allocate softc\n");
@@ -802,6 +797,7 @@ sddaregister(struct cam_periph *periph, void *arg)
 	if (softc->mmcdata == NULL) {
 		printf("sddaregister: Unable to probe new device. "
 		    "Unable to allocate mmcdata\n");
+		free(softc, M_DEVBUF);
 		return (CAM_REQ_CMP_ERR);
 	}
 	periph->softc = softc;
@@ -1021,7 +1017,6 @@ static int
 mmc_sd_switch(struct cam_periph *periph, union ccb *ccb,
 	      uint8_t mode, uint8_t grp, uint8_t value,
 	      uint8_t *res) {
-
 	struct mmc_data mmc_d;
 	uint32_t arg;
 	int err;
@@ -1109,7 +1104,9 @@ sdda_start_init_task(void *context, int pending) {
 		      CAM_PRIORITY_NONE);
 
 	cam_periph_lock(periph);
+	cam_periph_hold(periph, PRIBIO|PCATCH);
 	sdda_start_init(context, new_ccb);
+	cam_periph_unhold(periph);
 	cam_periph_unlock(periph);
 	xpt_free_ccb(new_ccb);
 }
@@ -1301,7 +1298,6 @@ sdda_start_init(void *context, union ccb *start_ccb)
 			/* FIXME: there should be a better name for this option...*/
 			mmcp->card_features |= CARD_FEATURE_SDHC;
 		}
-
 	}
 	CAM_DEBUG(periph->path, CAM_DEBUG_PERIPH,
 	    ("Capacity: %"PRIu64", sectors: %"PRIu64"\n",
@@ -1503,6 +1499,7 @@ finish_hs_tests:
 
 	softc->state = SDDA_STATE_NORMAL;
 
+	cam_periph_unhold(periph);
 	/* MMC partitions support */
 	if (mmcp->card_features & CARD_FEATURE_MMC && mmc_get_spec_vers(periph) >= 4) {
 		sdda_process_mmc_partitions(periph, start_ccb);
@@ -1514,6 +1511,7 @@ finish_hs_tests:
 		    sdda_get_read_only(periph, start_ccb));
 		softc->part_curr = 0;
 	}
+	cam_periph_hold(periph, PRIBIO|PCATCH);
 
 	xpt_announce_periph(periph, softc->card_id_string);
 	/*

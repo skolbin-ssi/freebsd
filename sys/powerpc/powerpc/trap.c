@@ -172,7 +172,6 @@ static struct powerpc_exception powerpc_exceptions[] = {
     "\020L3DAT\017APE\016DPE\015TEA\014b20\013b21\012b22\011b23"	\
     "\010b24\007b25\006b26\005b27\004b28\003b29\002b30\001b31"
 
-
 static const char *
 trapname(u_int vector)
 {
@@ -207,7 +206,7 @@ trap(struct trapframe *frame)
 	int		sig, type, user;
 	u_int		ucode;
 	ksiginfo_t	ksi;
-	register_t 	fscr;
+	register_t 	addr, fscr;
 
 	VM_CNT_INC(v_trap);
 
@@ -224,6 +223,7 @@ trap(struct trapframe *frame)
 	type = ucode = frame->exc;
 	sig = 0;
 	user = frame->srr1 & PSL_PR;
+	addr = 0;
 
 	CTR3(KTR_TRAP, "trap: %s type=%s (%s)", td->td_name,
 	    trapname(type), user ? "user" : "kernel");
@@ -248,6 +248,7 @@ trap(struct trapframe *frame)
 	if (user) {
 		td->td_pticks = 0;
 		td->td_frame = frame;
+		addr = frame->srr0;
 		if (td->td_cowgen != p->p_cowgen)
 			thread_cow_update(td);
 
@@ -261,18 +262,22 @@ trap(struct trapframe *frame)
 			break;
 
 #if defined(__powerpc64__) && defined(AIM)
-		case EXC_ISE:
 		case EXC_DSE:
+			addr = frame->dar;
+			/* FALLTHROUGH */
+		case EXC_ISE:
 			/* DSE/ISE are automatically fatal with radix pmap. */
 			if (radix_mmu ||
 			    handle_user_slb_spill(&p->p_vmspace->vm_pmap,
-			    (type == EXC_ISE) ? frame->srr0 : frame->dar) != 0){
+			    addr) != 0){
 				sig = SIGSEGV;
 				ucode = SEGV_MAPERR;
 			}
 			break;
 #endif
 		case EXC_DSI:
+			addr = frame->dar;
+			/* FALLTHROUGH */
 		case EXC_ISI:
 			if (trap_pfault(frame, true, &sig, &ucode))
 				sig = 0;
@@ -368,6 +373,7 @@ trap(struct trapframe *frame)
 			if (fix_unaligned(td, frame) != 0) {
 				sig = SIGBUS;
 				ucode = BUS_ADRALN;
+				addr = frame->dar;
 			}
 			else
 				frame->srr0 += 4;
@@ -481,7 +487,7 @@ trap(struct trapframe *frame)
 		ksiginfo_init_trap(&ksi);
 		ksi.ksi_signo = sig;
 		ksi.ksi_code = (int) ucode; /* XXX, not POSIX */
-		ksi.ksi_addr = (void *)frame->srr0;
+		ksi.ksi_addr = (void *)addr;
 		ksi.ksi_trapno = type;
 		trapsignal(td, &ksi);
 	}

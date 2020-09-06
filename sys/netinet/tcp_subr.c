@@ -340,7 +340,6 @@ static void tcp_mtudisc(struct inpcb *, int);
 static char *	tcp_log_addr(struct in_conninfo *inc, struct tcphdr *th,
 		    void *ip4hdr, const void *ip6hdr);
 
-
 static struct tcp_function_block tcp_def_funcblk = {
 	.tfb_tcp_block_name = "freebsd",
 	.tfb_tcp_output = tcp_output,
@@ -1713,6 +1712,7 @@ tcp_newtcpcb(struct inpcb *inp)
 		if (CC_ALGO(tp)->cb_init(tp->ccv) > 0) {
 			if (tp->t_fb->tfb_tcp_fb_fini)
 				(*tp->t_fb->tfb_tcp_fb_fini)(tp, 1);
+			in_pcbrele_wlocked(inp);
 			refcount_release(&tp->t_fb->tfb_refcnt);
 			uma_zfree(V_tcpcb_zone, tm);
 			return (NULL);
@@ -1723,6 +1723,7 @@ tcp_newtcpcb(struct inpcb *inp)
 	if (khelp_init_osd(HELPER_CLASS_TCP, tp->osd)) {
 		if (tp->t_fb->tfb_tcp_fb_fini)
 			(*tp->t_fb->tfb_tcp_fb_fini)(tp, 1);
+		in_pcbrele_wlocked(inp);
 		refcount_release(&tp->t_fb->tfb_refcnt);
 		uma_zfree(V_tcpcb_zone, tm);
 		return (NULL);
@@ -1783,7 +1784,12 @@ tcp_newtcpcb(struct inpcb *inp)
 	tcp_log_tcpcbinit(tp);
 #endif
 	if (tp->t_fb->tfb_tcp_fb_init) {
-		(*tp->t_fb->tfb_tcp_fb_init)(tp);
+		if ((*tp->t_fb->tfb_tcp_fb_init)(tp)) {
+			refcount_release(&tp->t_fb->tfb_refcnt);
+			in_pcbrele_wlocked(inp);
+			uma_zfree(V_tcpcb_zone, tm);
+			return (NULL);
+		}
 	}
 #ifdef STATS
 	if (V_tcp_perconn_stats_enable == 1)
@@ -2430,7 +2436,6 @@ SYSCTL_PROC(_net_inet6_tcp6, OID_AUTO, getcred,
     "Get the xucred of a TCP6 connection");
 #endif /* INET6 */
 
-
 #ifdef INET
 void
 tcp_ctlinput(int cmd, struct sockaddr *sa, void *vip)
@@ -2927,7 +2932,6 @@ tcp_maxmtu(struct in_conninfo *inc, struct tcp_ifcap *cap)
 	KASSERT(inc != NULL, ("tcp_maxmtu with NULL in_conninfo pointer"));
 
 	if (inc->inc_faddr.s_addr != INADDR_ANY) {
-
 		nh = fib4_lookup(inc->inc_fibnum, inc->inc_faddr, 0, NHR_NONE, 0);
 		if (nh == NULL)
 			return (0);

@@ -192,9 +192,6 @@ vm_object_zdtor(void *mem, int size, void *arg)
 	    ("object %p has reservations",
 	    object));
 #endif
-	KASSERT(blockcount_read(&object->paging_in_progress) == 0,
-	    ("object %p paging_in_progress = %d",
-	    object, blockcount_read(&object->paging_in_progress)));
 	KASSERT(!vm_object_busied(object),
 	    ("object %p busy = %d", object, blockcount_read(&object->busy)));
 	KASSERT(object->resident_page_count == 0,
@@ -281,7 +278,7 @@ vm_object_init(void)
 {
 	TAILQ_INIT(&vm_object_list);
 	mtx_init(&vm_object_list_mtx, "vm object_list", NULL, MTX_DEF);
-	
+
 	rw_init(&kernel_object->lock, "kernel vm object");
 	_vm_object_allocate(OBJT_PHYS, atop(VM_MAX_KERNEL_ADDRESS -
 	    VM_MIN_KERNEL_ADDRESS), OBJ_UNMANAGED, kernel_object, NULL);
@@ -294,6 +291,9 @@ vm_object_init(void)
 	 * The lock portion of struct vm_object must be type stable due
 	 * to vm_pageout_fallback_object_lock locking a vm object
 	 * without holding any references to it.
+	 *
+	 * paging_in_progress is valid always.  Lockless references to
+	 * the objects may acquire pip and then check OBJ_DEAD.
 	 */
 	obj_zone = uma_zcreate("VM OBJECT", sizeof (struct vm_object), NULL,
 #ifdef INVARIANTS
@@ -555,7 +555,6 @@ vm_object_deallocate_vnode(vm_object_t object)
 	/* vrele may need the vnode lock. */
 	vrele(vp);
 }
-
 
 /*
  * We dropped a reference on an object and discovered that it had a
@@ -936,12 +935,13 @@ vm_object_terminate(vm_object_t object)
 	    ("terminating shadow obj %p", object));
 
 	/*
-	 * wait for the pageout daemon to be done with the object
+	 * Wait for the pageout daemon and other current users to be
+	 * done with the object.  Note that new paging_in_progress
+	 * users can come after this wait, but they must check
+	 * OBJ_DEAD flag set (without unlocking the object), and avoid
+	 * the object being terminated.
 	 */
 	vm_object_pip_wait(object, "objtrm");
-
-	KASSERT(!blockcount_read(&object->paging_in_progress),
-	    ("vm_object_terminate: pageout in progress"));
 
 	KASSERT(object->ref_count == 0,
 	    ("vm_object_terminate: object with references, ref_count=%d",
@@ -2268,7 +2268,6 @@ vm_object_coalesce(vm_object_t prev_object, vm_ooffset_t prev_offset,
 	 * Account for the charge.
 	 */
 	if (prev_object->cred != NULL) {
-
 		/*
 		 * If prev_object was charged, then this mapping,
 		 * although not charged now, may become writable
@@ -2434,7 +2433,6 @@ vm_object_vnode(vm_object_t object)
 	return (vp);
 }
 
-
 /*
  * Busy the vm object.  This prevents new pages belonging to the object from
  * becoming busy.  Existing pages persist as busy.  Callers are responsible
@@ -2581,7 +2579,7 @@ sysctl_vm_object_list(SYSCTL_HANDLER_ARGS)
 			vref(vp);
 		VM_OBJECT_RUNLOCK(obj);
 		if (vp != NULL) {
-			vn_fullpath(curthread, vp, &fullpath, &freepath);
+			vn_fullpath(vp, &fullpath, &freepath);
 			vn_lock(vp, LK_SHARED | LK_RETRY);
 			if (VOP_GETATTR(vp, &va, curthread->td_ucred) == 0) {
 				kvo->kvo_vn_fileid = va.va_fileid;

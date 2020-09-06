@@ -61,7 +61,6 @@ __FBSDID("$FreeBSD$");
 #define XEN_APIC_UNSUPPORTED \
 	panic("%s: not available in Xen PV port.", __func__)
 
-
 /*--------------------------- Forward Declarations ---------------------------*/
 #ifdef SMP
 static driver_filter_t xen_smp_rendezvous_action;
@@ -76,6 +75,7 @@ static driver_filter_t xen_invlcache;
 static driver_filter_t xen_ipi_bitmap_handler;
 static driver_filter_t xen_cpustop_handler;
 static driver_filter_t xen_cpususpend_handler;
+static driver_filter_t xen_ipi_swi_handler;
 #endif
 
 /*---------------------------------- Macros ----------------------------------*/
@@ -103,6 +103,7 @@ static struct xen_ipi_handler xen_ipis[] =
 	[IPI_TO_IDX(IPI_BITMAP_VECTOR)] = { xen_ipi_bitmap_handler,	"b"   },
 	[IPI_TO_IDX(IPI_STOP)]		= { xen_cpustop_handler,	"st"  },
 	[IPI_TO_IDX(IPI_SUSPEND)]	= { xen_cpususpend_handler,	"sp"  },
+	[IPI_TO_IDX(IPI_SWI)]		= { xen_ipi_swi_handler,	"sw"  },
 };
 #endif
 
@@ -522,6 +523,15 @@ xen_cpususpend_handler(void *arg)
 	return (FILTER_HANDLED);
 }
 
+static int
+xen_ipi_swi_handler(void *arg)
+{
+	struct trapframe *frame = arg;
+
+	ipi_swi_handler(*frame);
+	return (FILTER_HANDLED);
+}
+
 /*----------------------------- XEN PV IPI setup -----------------------------*/
 /*
  * Those functions are provided outside of the Xen PV APIC implementation
@@ -538,7 +548,6 @@ xen_cpu_ipi_init(int cpu)
 	ipi_handle = DPCPU_ID_GET(cpu, ipi_handle);
 
 	for (ipi = xen_ipis, idx = 0; idx < nitems(xen_ipis); ipi++, idx++) {
-
 		if (ipi->filter == NULL) {
 			ipi_handle[idx] = NULL;
 			continue;
