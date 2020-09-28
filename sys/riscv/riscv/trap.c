@@ -117,9 +117,8 @@ cpu_fetch_syscall_args(struct thread *td)
 	else
 		sa->callp = &p->p_sysent->sv_table[sa->code];
 
-	sa->narg = sa->callp->sy_narg;
 	memcpy(sa->args, ap, nap * sizeof(register_t));
-	if (sa->narg > nap)
+	if (sa->callp->sy_narg > nap)
 		panic("TODO: Could we have more then %d args?", NARGREG);
 
 	td->td_retval[0] = 0;
@@ -136,15 +135,15 @@ dump_regs(struct trapframe *frame)
 	int n;
 	int i;
 
-	n = (sizeof(frame->tf_t) / sizeof(frame->tf_t[0]));
+	n = nitems(frame->tf_t);
 	for (i = 0; i < n; i++)
 		printf("t[%d] == 0x%016lx\n", i, frame->tf_t[i]);
 
-	n = (sizeof(frame->tf_s) / sizeof(frame->tf_s[0]));
+	n = nitems(frame->tf_s);
 	for (i = 0; i < n; i++)
 		printf("s[%d] == 0x%016lx\n", i, frame->tf_s[i]);
 
-	n = (sizeof(frame->tf_a) / sizeof(frame->tf_a[0]));
+	n = nitems(frame->tf_a);
 	for (i = 0; i < n; i++)
 		printf("a[%d] == 0x%016lx\n", i, frame->tf_a[i]);
 
@@ -306,7 +305,7 @@ do_trap_supervisor(struct trapframe *frame)
 		break;
 	default:
 		dump_regs(frame);
-		panic("Unknown kernel exception %x trap value %lx\n",
+		panic("Unknown kernel exception %lx trap value %lx\n",
 		    exception, frame->tf_stval);
 	}
 }
@@ -375,7 +374,7 @@ do_trap_user(struct trapframe *frame)
 		break;
 	default:
 		dump_regs(frame);
-		panic("Unknown userland exception %x, trap value %lx\n",
+		panic("Unknown userland exception %lx, trap value %lx\n",
 		    exception, frame->tf_stval);
 	}
 }

@@ -115,7 +115,6 @@ _Static_assert(__offsetof(struct route, ro_dst) == __offsetof(_ro_new, _dst_new)
 struct rib_head *rt_tables_get_rnh(uint32_t table, sa_family_t family);
 void rt_mpath_init_rnh(struct rib_head *rnh);
 int rt_getifa_fib(struct rt_addrinfo *info, u_int fibnum);
-void rt_setmetrics(const struct rt_addrinfo *info, struct rtentry *rt);
 #ifdef RADIX_MPATH
 struct radix_node *rt_mpath_unlink(struct rib_head *rnh,
     struct rt_addrinfo *info, struct rtentry *rto, int *perror);
@@ -224,6 +223,12 @@ struct route_nhop_data {
 int change_route_conditional(struct rib_head *rnh, struct rtentry *rt,
     struct rt_addrinfo *info, struct route_nhop_data *nhd_orig,
     struct route_nhop_data *nhd_new, struct rib_cmd_info *rc);
+struct rtentry *lookup_prefix(struct rib_head *rnh,
+    const struct rt_addrinfo *info, struct route_nhop_data *rnd);
+int check_info_match_nhop(const struct rt_addrinfo *info,
+    const struct rtentry *rt, const struct nhop_object *nh);
+int can_override_nhop(const struct rt_addrinfo *info,
+    const struct nhop_object *nh);
 
 void vnet_rtzone_init(void);
 void vnet_rtzone_destroy(void);
@@ -238,7 +243,6 @@ int nhops_init_rib(struct rib_head *rh);
 void nhops_destroy_rib(struct rib_head *rh);
 void nhop_ref_object(struct nhop_object *nh);
 int nhop_try_ref_object(struct nhop_object *nh);
-int nhop_ref_any(struct nhop_object *nh);
 void nhop_free_any(struct nhop_object *nh);
 
 void nhop_set_type(struct nhop_object *nh, enum nhop_type nh_type);
@@ -252,8 +256,5 @@ int nhop_create_from_nhop(struct rib_head *rnh, const struct nhop_object *nh_ori
 void nhops_update_ifmtu(struct rib_head *rh, struct ifnet *ifp, uint32_t mtu);
 int nhops_dump_sysctl(struct rib_head *rh, struct sysctl_req *w);
 
-/* route */
-struct rtentry *rt_unlinkrte(struct rib_head *rnh, struct rt_addrinfo *info,
-    int *perror);
 
 #endif

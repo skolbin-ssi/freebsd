@@ -849,18 +849,6 @@ rt_mpath_unlink(struct rib_head *rnh, struct rt_addrinfo *info,
 #endif
 
 void
-rt_setmetrics(const struct rt_addrinfo *info, struct rtentry *rt)
-{
-
-	if (info->rti_mflags & RTV_WEIGHT)
-		rt->rt_weight = info->rti_rmx->rmx_weight;
-	/* Kernel -> userland timebase conversion. */
-	if (info->rti_mflags & RTV_EXPIRE)
-		rt->rt_expire = info->rti_rmx->rmx_expire ?
-		    info->rti_rmx->rmx_expire - time_second + time_uptime : 0;
-}
-
-void
 rt_maskedcopy(struct sockaddr *src, struct sockaddr *dst, struct sockaddr *netmask)
 {
 	u_char *cp1 = (u_char *)src;
@@ -883,7 +871,6 @@ rt_maskedcopy(struct sockaddr *src, struct sockaddr *dst, struct sockaddr *netma
  * Set up a routing table entry, normally
  * for an interface.
  */
-#define _SOCKADDR_TMPSIZE 128 /* Not too big.. kernel stack size is limited */
 static inline  int
 rtinit1(struct ifaddr *ifa, int cmd, int flags, int fibnum)
 {
@@ -895,10 +882,10 @@ rtinit1(struct ifaddr *ifa, int cmd, int flags, int fibnum)
 	struct rt_addrinfo info;
 	int error = 0;
 	int startfib, endfib;
-	char tempbuf[_SOCKADDR_TMPSIZE];
+	struct sockaddr_storage ss;
 	int didwork = 0;
 	int a_failure = 0;
-	struct sockaddr_dl_short *sdl = NULL;
+	struct sockaddr_dl_short sdl;
 	struct rib_head *rnh;
 
 	if (flags & RTF_HOST) {
@@ -946,17 +933,15 @@ rtinit1(struct ifaddr *ifa, int cmd, int flags, int fibnum)
 		 * XXX this is kinda inet specific..
 		 */
 		if (netmask != NULL) {
-			rt_maskedcopy(dst, (struct sockaddr *)tempbuf, netmask);
-			dst = (struct sockaddr *)tempbuf;
+			rt_maskedcopy(dst, (struct sockaddr *)&ss, netmask);
+			dst = (struct sockaddr *)&ss;
 		}
-	} else if (cmd == RTM_ADD) {
-		sdl = (struct sockaddr_dl_short *)tempbuf;
-		bzero(sdl, sizeof(struct sockaddr_dl_short));
-		sdl->sdl_family = AF_LINK;
-		sdl->sdl_len = sizeof(struct sockaddr_dl_short);
-		sdl->sdl_type = ifa->ifa_ifp->if_type;
-		sdl->sdl_index = ifa->ifa_ifp->if_index;
-        }
+	}
+	bzero(&sdl, sizeof(struct sockaddr_dl_short));
+	sdl.sdl_family = AF_LINK;
+	sdl.sdl_len = sizeof(struct sockaddr_dl_short);
+	sdl.sdl_type = ifa->ifa_ifp->if_type;
+	sdl.sdl_index = ifa->ifa_ifp->if_index;
 	/*
 	 * Now go through all the requested tables (fibs) and do the
 	 * requested action. Realistically, this will either be fib 0
@@ -1012,13 +997,7 @@ rtinit1(struct ifaddr *ifa, int cmd, int flags, int fibnum)
 		info.rti_flags = flags |
 		    (ifa->ifa_flags & ~IFA_RTSELF) | RTF_PINNED;
 		info.rti_info[RTAX_DST] = dst;
-		/* 
-		 * doing this for compatibility reasons
-		 */
-		if (cmd == RTM_ADD)
-			info.rti_info[RTAX_GATEWAY] = (struct sockaddr *)sdl;
-		else
-			info.rti_info[RTAX_GATEWAY] = ifa->ifa_addr;
+		info.rti_info[RTAX_GATEWAY] = (struct sockaddr *)&sdl;
 		info.rti_info[RTAX_NETMASK] = netmask;
 		NET_EPOCH_ENTER(et);
 		error = rib_action(fibnum, cmd, &info, &rc);

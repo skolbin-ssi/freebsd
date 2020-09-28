@@ -1298,6 +1298,11 @@ if_vmove(struct ifnet *ifp, struct vnet *new_vnet)
 	ifindex_free_locked(ifp->if_index);
 	IFNET_WUNLOCK();
 
+
+	/* Don't re-attach DYING interfaces. */
+	if (ifp->if_flags & IFF_DYING)
+		return (0);
+
 	/*
 	 * Perform interface-specific reassignment tasks, if provided by
 	 * the driver.
@@ -2512,6 +2517,18 @@ ifhwioctl(u_long cmd, struct ifnet *ifp, caddr_t data, struct thread *td)
 		ifr->ifr_reqcap = ifp->if_capabilities;
 		ifr->ifr_curcap = ifp->if_capenable;
 		break;
+
+	case SIOCGIFDATA:
+	{
+		struct if_data ifd;
+
+		/* Ensure uninitialised padding is not leaked. */
+		memset(&ifd, 0, sizeof(ifd));
+
+		if_data_copy(ifp, &ifd);
+		error = copyout(&ifd, ifr_data_get_ptr(ifr), sizeof(ifd));
+		break;
+	}
 
 #ifdef MAC
 	case SIOCGIFMAC:

@@ -125,7 +125,7 @@ struct 	fileops vnops = {
 	.fo_flags = DFLAG_PASSABLE | DFLAG_SEEKABLE
 };
 
-static const int io_hold_cnt = 16;
+const u_int io_hold_cnt = 16;
 static int vn_io_fault_enable = 1;
 SYSCTL_INT(_debug, OID_AUTO, vn_io_fault_enable, CTLFLAG_RWTUN,
     &vn_io_fault_enable, 0, "Enable vn_io_fault lock avoidance");
@@ -192,6 +192,23 @@ vn_open(struct nameidata *ndp, int *flagp, int cmode, struct file *fp)
 	return (vn_open_cred(ndp, flagp, cmode, 0, td->td_ucred, fp));
 }
 
+static uint64_t
+open2nameif(int fmode, u_int vn_open_flags)
+{
+	uint64_t res;
+
+	res = ISOPEN | LOCKLEAF;
+	if ((fmode & O_BENEATH) != 0)
+		res |= BENEATH;
+	if ((fmode & O_RESOLVE_BENEATH) != 0)
+		res |= RBENEATH;
+	if ((vn_open_flags & VN_OPEN_NOAUDIT) == 0)
+		res |= AUDITVNODE1;
+	if ((vn_open_flags & VN_OPEN_NOCAPCHECK) != 0)
+		res |= NOCAPCHECK;
+	return (res);
+}
+
 /*
  * Common code for vnode open operations via a name lookup.
  * Lookup the vnode and invoke VOP_CREATE if needed.
@@ -218,19 +235,14 @@ restart:
 		return (EINVAL);
 	else if ((fmode & (O_CREAT | O_DIRECTORY)) == O_CREAT) {
 		ndp->ni_cnd.cn_nameiop = CREATE;
+		ndp->ni_cnd.cn_flags = open2nameif(fmode, vn_open_flags);
 		/*
 		 * Set NOCACHE to avoid flushing the cache when
 		 * rolling in many files at once.
 		*/
-		ndp->ni_cnd.cn_flags = ISOPEN | LOCKPARENT | LOCKLEAF | NOCACHE;
+		ndp->ni_cnd.cn_flags |= LOCKPARENT | NOCACHE;
 		if ((fmode & O_EXCL) == 0 && (fmode & O_NOFOLLOW) == 0)
 			ndp->ni_cnd.cn_flags |= FOLLOW;
-		if ((fmode & O_BENEATH) != 0)
-			ndp->ni_cnd.cn_flags |= BENEATH;
-		if (!(vn_open_flags & VN_OPEN_NOAUDIT))
-			ndp->ni_cnd.cn_flags |= AUDITVNODE1;
-		if (vn_open_flags & VN_OPEN_NOCAPCHECK)
-			ndp->ni_cnd.cn_flags |= NOCAPCHECK;
 		if ((vn_open_flags & VN_OPEN_INVFS) == 0)
 			bwillwrite();
 		if ((error = namei(ndp)) != 0)
@@ -285,16 +297,11 @@ restart:
 		}
 	} else {
 		ndp->ni_cnd.cn_nameiop = LOOKUP;
-		ndp->ni_cnd.cn_flags = ISOPEN |
-		    ((fmode & O_NOFOLLOW) ? NOFOLLOW : FOLLOW) | LOCKLEAF;
-		if (!(fmode & FWRITE))
+		ndp->ni_cnd.cn_flags = open2nameif(fmode, vn_open_flags);
+		ndp->ni_cnd.cn_flags |= (fmode & O_NOFOLLOW) != 0 ? NOFOLLOW :
+		    FOLLOW;
+		if ((fmode & FWRITE) == 0)
 			ndp->ni_cnd.cn_flags |= LOCKSHARED;
-		if ((fmode & O_BENEATH) != 0)
-			ndp->ni_cnd.cn_flags |= BENEATH;
-		if (!(vn_open_flags & VN_OPEN_NOAUDIT))
-			ndp->ni_cnd.cn_flags |= AUDITVNODE1;
-		if (vn_open_flags & VN_OPEN_NOCAPCHECK)
-			ndp->ni_cnd.cn_flags |= NOCAPCHECK;
 		if ((error = namei(ndp)) != 0)
 			return (error);
 		vp = ndp->ni_vp;
@@ -848,7 +855,7 @@ get_advice(struct file *fp, struct uio *uio)
 	return (ret);
 }
 
-static int
+int
 vn_read_from_obj(struct vnode *vp, struct uio *uio)
 {
 	vm_object_t obj;
@@ -951,15 +958,6 @@ out_pip:
 	return (uio->uio_resid == 0 ? 0 : EJUSTRETURN);
 }
 
-static bool
-do_vn_read_from_pgcache(struct vnode *vp, struct uio *uio, struct file *fp)
-{
-	return ((vp->v_irflag & (VIRF_DOOMED | VIRF_PGREAD)) == VIRF_PGREAD &&
-	    !mac_vnode_check_read_enabled() &&
-	    uio->uio_resid <= ptoa(io_hold_cnt) && uio->uio_offset >= 0 &&
-	    (fp->f_flag & O_DIRECT) == 0 && vn_io_pgcache_read_enable);
-}
-
 /*
  * File table vnode read routine.
  */
@@ -976,8 +974,19 @@ vn_read(struct file *fp, struct uio *uio, struct ucred *active_cred, int flags,
 	    uio->uio_td, td));
 	KASSERT(flags & FOF_OFFSET, ("No FOF_OFFSET"));
 	vp = fp->f_vnode;
-	if (do_vn_read_from_pgcache(vp, uio, fp)) {
-		error = vn_read_from_obj(vp, uio);
+	ioflag = 0;
+	if (fp->f_flag & FNONBLOCK)
+		ioflag |= IO_NDELAY;
+	if (fp->f_flag & O_DIRECT)
+		ioflag |= IO_DIRECT;
+
+	/*
+	 * Try to read from page cache.  VIRF_DOOMED check is racy but
+	 * allows us to avoid unneeded work outright.
+	 */
+	if (vn_io_pgcache_read_enable && !mac_vnode_check_read_enabled() &&
+	    (vp->v_irflag & (VIRF_DOOMED | VIRF_PGREAD)) == VIRF_PGREAD) {
+		error = VOP_READ_PGCACHE(vp, uio, ioflag, fp->f_cred);
 		if (error == 0) {
 			fp->f_nextoff[UIO_READ] = uio->uio_offset;
 			return (0);
@@ -985,11 +994,7 @@ vn_read(struct file *fp, struct uio *uio, struct ucred *active_cred, int flags,
 		if (error != EJUSTRETURN)
 			return (error);
 	}
-	ioflag = 0;
-	if (fp->f_flag & FNONBLOCK)
-		ioflag |= IO_NDELAY;
-	if (fp->f_flag & O_DIRECT)
-		ioflag |= IO_DIRECT;
+
 	advice = get_advice(fp, uio);
 	vn_lock(vp, LK_SHARED | LK_RETRY);
 
@@ -2632,7 +2637,7 @@ vn_mmap(struct file *fp, vm_map_t map, vm_offset_t *addr, vm_size_t size,
 #ifdef _LP64
 	    size > OFF_MAX ||
 #endif
-	    foff < 0 || foff > OFF_MAX - size)
+	    foff > OFF_MAX - size)
 		return (EINVAL);
 
 	writecounted = FALSE;

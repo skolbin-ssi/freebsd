@@ -4668,11 +4668,8 @@ vfs_periodic_msync_inactive(struct mount *mp, int flags)
 {
 	struct vnode *vp, *mvp;
 	struct vm_object *obj;
-	struct thread *td;
 	int lkflags, objflags;
 	bool seen_defer;
-
-	td = curthread;
 
 	lkflags = LK_EXCLUSIVE | LK_INTERLOCK;
 	if (flags != MNT_WAIT) {
@@ -5839,6 +5836,15 @@ vop_read_post(void *ap, int rc)
 
 	if (!rc)
 		VFS_KNOTE_LOCKED(a->a_vp, NOTE_READ);
+}
+
+void
+vop_read_pgcache_post(void *ap, int rc)
+{
+	struct vop_read_pgcache_args *a = ap;
+
+	if (!rc)
+		VFS_KNOTE_UNLOCKED(a->a_vp, NOTE_READ);
 }
 
 void

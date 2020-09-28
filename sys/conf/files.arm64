@@ -255,6 +255,11 @@ dev/axgbe/xgbe-dev.c		optional	axgbe
 dev/axgbe/xgbe-drv.c		optional	axgbe
 dev/axgbe/xgbe-mdio.c		optional	axgbe
 dev/cpufreq/cpufreq_dt.c	optional	cpufreq fdt
+dev/gpio/pl061.c		optional	pl061 gpio
+dev/gpio/pl061_acpi.c		optional	pl061 gpio acpi
+dev/gpio/pl061_fdt.c		optional	pl061 gpio fdt
+dev/hwpmc/hwpmc_arm64.c		optional	hwpmc
+dev/hwpmc/hwpmc_arm64_md.c	optional	hwpmc
 dev/ice/if_ice_iflib.c		optional	ice pci \
 	compile-with "${NORMAL_C} -I$S/dev/ice"
 dev/ice/ice_lib.c		optional	ice pci \
@@ -305,8 +310,6 @@ dev/iicbus/sy8106a.c		optional	sy8106a fdt
 dev/iicbus/twsi/mv_twsi.c	optional	twsi fdt
 dev/iicbus/twsi/a10_twsi.c	optional	twsi fdt
 dev/iicbus/twsi/twsi.c		optional	twsi fdt
-dev/hwpmc/hwpmc_arm64.c		optional	hwpmc
-dev/hwpmc/hwpmc_arm64_md.c	optional	hwpmc
 dev/mbox/mbox_if.m		optional	soc_brcm_bcm2837
 dev/mmc/host/dwmmc.c		optional	dwmmc fdt
 dev/mmc/host/dwmmc_altera.c	optional	dwmmc dwmmc_altera fdt
@@ -339,6 +342,7 @@ dev/usb/controller/generic_ehci_acpi.c optional	ehci acpi
 dev/usb/controller/generic_ehci_fdt.c optional	ehci fdt
 dev/usb/controller/generic_ohci.c optional	ohci fdt
 dev/usb/controller/generic_usb_if.m optional	ohci fdt
+dev/usb/controller/musb_otg_allwinner.c	optional musb fdt soc_allwinner_a64
 dev/usb/controller/usb_nop_xceiv.c	optional fdt ext_resources
 dev/usb/controller/generic_xhci.c	optional	xhci
 dev/usb/controller/generic_xhci_acpi.c	optional	xhci acpi
