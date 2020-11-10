@@ -153,6 +153,11 @@ static struct powerpc_exception powerpc_exceptions[] = {
 	{ EXC_LAST,	NULL }
 };
 
+static int uprintf_signal;
+SYSCTL_INT(_machdep, OID_AUTO, uprintf_signal, CTLFLAG_RWTUN,
+    &uprintf_signal, 0,
+    "Print debugging information on trap signal to ctty");
+
 #define ESR_BITMASK							\
     "\20"								\
     "\040b0\037b1\036b2\035b3\034PIL\033PRR\032PTR\031FP"		\
@@ -400,16 +405,24 @@ trap(struct trapframe *frame)
 #endif
  				sig = SIGTRAP;
 				ucode = TRAP_BRKPT;
-			} else {
-				sig = ppc_instr_emulate(frame, td);
-				if (sig == SIGILL) {
-					if (frame->srr1 & EXC_PGM_PRIV)
-						ucode = ILL_PRVOPC;
-					else if (frame->srr1 & EXC_PGM_ILLEGAL)
-						ucode = ILL_ILLOPC;
-				} else if (sig == SIGFPE)
-					ucode = FPE_FLTINV;	/* Punt for now, invalid operation. */
+				break;
 			}
+
+			if ((frame->srr1 & EXC_PGM_FPENABLED) &&
+			     (td->td_pcb->pcb_flags & PCB_FPU))
+				sig = SIGFPE;
+			else
+				sig = ppc_instr_emulate(frame, td);
+
+			if (sig == SIGILL) {
+				if (frame->srr1 & EXC_PGM_PRIV)
+					ucode = ILL_PRVOPC;
+				else if (frame->srr1 & EXC_PGM_ILLEGAL)
+					ucode = ILL_ILLOPC;
+			} else if (sig == SIGFPE) {
+				ucode = get_fpu_exception(td);
+			}
+
 			break;
 
 		case EXC_MCHK:
@@ -489,6 +502,14 @@ trap(struct trapframe *frame)
 		ksi.ksi_code = (int) ucode; /* XXX, not POSIX */
 		ksi.ksi_addr = (void *)addr;
 		ksi.ksi_trapno = type;
+		if (uprintf_signal) {
+			uprintf("pid %d comm %s: signal %d code %d type %d "
+				"addr 0x%lx r1 0x%lx srr0 0x%lx srr1 0x%lx\n",
+			        p->p_pid, p->p_comm, sig, ucode, type,
+				(u_long)addr, (u_long)frame->fixreg[1],
+				(u_long)frame->srr0, (u_long)frame->srr1);
+		}
+
 		trapsignal(td, &ksi);
 	}
 
@@ -951,7 +972,7 @@ fix_unaligned(struct thread *td, struct trapframe *frame)
 static void
 normalize_inputs(void)
 {
-	unsigned long msr;
+	register_t msr;
 
 	/* enable VSX */
 	msr = mfmsr();

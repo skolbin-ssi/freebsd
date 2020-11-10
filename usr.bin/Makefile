@@ -7,6 +7,7 @@ SUBDIR=	alias \
 	apply \
 	asa \
 	awk \
+	backlight \
 	banner \
 	basename \
 	brandelf \
@@ -259,7 +260,9 @@ SUBDIR.${MK_TOOLCHAIN}+=	ar
 SUBDIR.${MK_TOOLCHAIN}+=	c89
 SUBDIR.${MK_TOOLCHAIN}+=	c99
 SUBDIR.${MK_TOOLCHAIN}+=	ctags
+.if ${MK_LLVM_CXXFILT} == "no"
 SUBDIR.${MK_TOOLCHAIN}+=	cxxfilt
+.endif
 SUBDIR.${MK_TOOLCHAIN}+=	objcopy
 SUBDIR.${MK_TOOLCHAIN}+=	file2c
 SUBDIR.${MK_TOOLCHAIN}+=	gprof

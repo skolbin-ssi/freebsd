@@ -4242,7 +4242,9 @@ sctp_aloc_assoc(struct sctp_inpcb *inp, struct sockaddr *firstaddr,
 			if ((ntohs(sin->sin_port) == 0) ||
 			    (sin->sin_addr.s_addr == INADDR_ANY) ||
 			    (sin->sin_addr.s_addr == INADDR_BROADCAST) ||
-			    IN_MULTICAST(ntohl(sin->sin_addr.s_addr))) {
+			    IN_MULTICAST(ntohl(sin->sin_addr.s_addr)) ||
+			    (((inp->sctp_flags & SCTP_PCB_FLAGS_BOUND_V6) != 0) &&
+			    (SCTP_IPV6_V6ONLY(inp) != 0))) {
 				/* Invalid address */
 				SCTP_INP_RUNLOCK(inp);
 				SCTP_LTRACE_ERR_RET(inp, NULL, NULL, SCTP_FROM_SCTP_PCB, EINVAL);
@@ -4261,7 +4263,8 @@ sctp_aloc_assoc(struct sctp_inpcb *inp, struct sockaddr *firstaddr,
 			sin6 = (struct sockaddr_in6 *)firstaddr;
 			if ((ntohs(sin6->sin6_port) == 0) ||
 			    IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr) ||
-			    IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
+			    IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr) ||
+			    ((inp->sctp_flags & SCTP_PCB_FLAGS_BOUND_V6) == 0)) {
 				/* Invalid address */
 				SCTP_INP_RUNLOCK(inp);
 				SCTP_LTRACE_ERR_RET(inp, NULL, NULL, SCTP_FROM_SCTP_PCB, EINVAL);
@@ -4342,7 +4345,7 @@ sctp_aloc_assoc(struct sctp_inpcb *inp, struct sockaddr *firstaddr,
 	LIST_INSERT_HEAD(head, stcb, sctp_asocs);
 	SCTP_INP_INFO_WUNLOCK();
 
-	if ((err = sctp_add_remote_addr(stcb, firstaddr, NULL, port, SCTP_DO_SETSCOPE, SCTP_ALLOC_ASOC))) {
+	if (sctp_add_remote_addr(stcb, firstaddr, NULL, port, SCTP_DO_SETSCOPE, SCTP_ALLOC_ASOC)) {
 		/* failure.. memory error? */
 		if (asoc->strmout) {
 			SCTP_FREE(asoc->strmout, SCTP_M_STRMO);
@@ -6044,6 +6047,7 @@ sctp_load_addresses_from_init(struct sctp_tcb *stcb, struct mbuf *m,
 	peer_supports_prsctp = 0;
 	peer_supports_auth = 0;
 	peer_supports_asconf = 0;
+	peer_supports_asconf_ack = 0;
 	peer_supports_reconfig = 0;
 	peer_supports_nrsack = 0;
 	peer_supports_pktdrop = 0;

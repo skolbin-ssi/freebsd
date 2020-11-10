@@ -2708,6 +2708,111 @@ get_locked:
 	return (error);
 }
 
+#ifdef CAPABILITIES
+int
+fgetvp_lookup_smr(int fd, struct nameidata *ndp, struct vnode **vpp, bool *fsearch)
+{
+	const struct filedescent *fde;
+	const struct fdescenttbl *fdt;
+	struct filedesc *fdp;
+	struct file *fp;
+	struct vnode *vp;
+	const cap_rights_t *haverights;
+	cap_rights_t rights;
+	seqc_t seq;
+
+	VFS_SMR_ASSERT_ENTERED();
+
+	rights = *ndp->ni_rightsneeded;
+	cap_rights_set_one(&rights, CAP_LOOKUP);
+
+	fdp = curproc->p_fd;
+	fdt = fdp->fd_files;
+	if (__predict_false((u_int)fd >= fdt->fdt_nfiles))
+		return (EBADF);
+	seq = seqc_read_any(fd_seqc(fdt, fd));
+	if (__predict_false(seqc_in_modify(seq)))
+		return (EAGAIN);
+	fde = &fdt->fdt_ofiles[fd];
+	haverights = cap_rights_fde_inline(fde);
+	fp = fde->fde_file;
+	if (__predict_false(fp == NULL))
+		return (EAGAIN);
+	if (__predict_false(cap_check_inline_transient(haverights, &rights)))
+		return (EAGAIN);
+	*fsearch = ((fp->f_flag & FSEARCH) != 0);
+	vp = fp->f_vnode;
+	if (__predict_false(vp == NULL || vp->v_type != VDIR)) {
+		return (EAGAIN);
+	}
+	if (!filecaps_copy(&fde->fde_caps, &ndp->ni_filecaps, false)) {
+		return (EAGAIN);
+	}
+	/*
+	 * Use an acquire barrier to force re-reading of fdt so it is
+	 * refreshed for verification.
+	 */
+	atomic_thread_fence_acq();
+	fdt = fdp->fd_files;
+	if (__predict_false(!seqc_consistent_nomb(fd_seqc(fdt, fd), seq)))
+		return (EAGAIN);
+	/*
+	 * If file descriptor doesn't have all rights,
+	 * all lookups relative to it must also be
+	 * strictly relative.
+	 *
+	 * Not yet supported by fast path.
+	 */
+	CAP_ALL(&rights);
+	if (!cap_rights_contains(&ndp->ni_filecaps.fc_rights, &rights) ||
+	    ndp->ni_filecaps.fc_fcntls != CAP_FCNTL_ALL ||
+	    ndp->ni_filecaps.fc_nioctls != -1) {
+#ifdef notyet
+		ndp->ni_lcf |= NI_LCF_STRICTRELATIVE;
+#else
+		return (EAGAIN);
+#endif
+	}
+	*vpp = vp;
+	return (0);
+}
+#else
+int
+fgetvp_lookup_smr(int fd, struct nameidata *ndp, struct vnode **vpp, bool *fsearch)
+{
+	const struct fdescenttbl *fdt;
+	struct filedesc *fdp;
+	struct file *fp;
+	struct vnode *vp;
+
+	VFS_SMR_ASSERT_ENTERED();
+
+	fdp = curproc->p_fd;
+	fdt = fdp->fd_files;
+	if (__predict_false((u_int)fd >= fdt->fdt_nfiles))
+		return (EBADF);
+	fp = fdt->fdt_ofiles[fd].fde_file;
+	if (__predict_false(fp == NULL))
+		return (EAGAIN);
+	*fsearch = ((fp->f_flag & FSEARCH) != 0);
+	vp = fp->f_vnode;
+	if (__predict_false(vp == NULL || vp->v_type != VDIR)) {
+		return (EAGAIN);
+	}
+	/*
+	 * Use an acquire barrier to force re-reading of fdt so it is
+	 * refreshed for verification.
+	 */
+	atomic_thread_fence_acq();
+	fdt = fdp->fd_files;
+	if (__predict_false(fp != fdt->fdt_ofiles[fd].fde_file))
+		return (EAGAIN);
+	filecaps_fill(&ndp->ni_filecaps);
+	*vpp = vp;
+	return (0);
+}
+#endif
+
 int
 fget_unlocked_seq(struct filedesc *fdp, int fd, cap_rights_t *needrightsp,
     struct file **fpp, seqc_t *seqp)
@@ -2758,7 +2863,7 @@ fget_unlocked_seq(struct filedesc *fdp, int fd, cap_rights_t *needrightsp,
 			 * This re-read is not any more racy than using the
 			 * return value from fcmpset.
 			 */
-			if (fp->f_count != 0)
+			if (refcount_load(&fp->f_count) != 0)
 				return (EBADF);
 			/*
 			 * Force a reload. Other thread could reallocate the
@@ -3114,9 +3219,13 @@ int __noinline
 _fdrop(struct file *fp, struct thread *td)
 {
 	int error;
+#ifdef INVARIANTS
+	int count;
 
-	if (fp->f_count != 0)
-		panic("fdrop: count %d", fp->f_count);
+	count = refcount_load(&fp->f_count);
+	if (count != 0)
+		panic("fdrop: fp %p count %d", fp, count);
+#endif
 	error = fo_close(fp, td);
 	atomic_subtract_int(&openfiles, 1);
 	crfree(fp->f_cred);
@@ -3344,6 +3453,17 @@ pwd_hold_filedesc(struct filedesc *fdp)
 	return (pwd);
 }
 
+bool
+pwd_hold_smr(struct pwd *pwd)
+{
+
+	MPASS(pwd != NULL);
+	if (__predict_true(refcount_acquire_if_not_zero(&pwd->pwd_refcount))) {
+		return (true);
+	}
+	return (false);
+}
+
 struct pwd *
 pwd_hold(struct thread *td)
 {
@@ -3354,8 +3474,7 @@ pwd_hold(struct thread *td)
 
 	vfs_smr_enter();
 	pwd = vfs_smr_entered_load(&fdp->fd_pwd);
-	MPASS(pwd != NULL);
-	if (__predict_true(refcount_acquire_if_not_zero(&pwd->pwd_refcount))) {
+	if (pwd_hold_smr(pwd)) {
 		vfs_smr_exit();
 		return (pwd);
 	}
@@ -3714,7 +3833,7 @@ sysctl_kern_file(SYSCTL_HANDLER_ARGS)
 			xf.xf_data = (uintptr_t)fp->f_data;
 			xf.xf_vnode = (uintptr_t)fp->f_vnode;
 			xf.xf_type = (uintptr_t)fp->f_type;
-			xf.xf_count = fp->f_count;
+			xf.xf_count = refcount_load(&fp->f_count);
 			xf.xf_msgcount = 0;
 			xf.xf_offset = foffset_get(fp);
 			xf.xf_flag = fp->f_flag;
@@ -3797,7 +3916,7 @@ export_file_to_kinfo(struct file *fp, int fd, cap_rights_t *rightsp,
 	else
 		cap_rights_init_zero(&kif->kf_cap_rights);
 	kif->kf_fd = fd;
-	kif->kf_ref_count = fp->f_count;
+	kif->kf_ref_count = refcount_load(&fp->f_count);
 	kif->kf_offset = foffset_get(fp);
 
 	/*
@@ -4327,7 +4446,7 @@ db_print_file(struct file *fp, int header)
 	p = file_to_first_proc(fp);
 	db_printf("%*p %6s %*p %08x %04x %5d %6d %*p %5d %s\n", XPTRWIDTH,
 	    fp, file_type_to_name(fp->f_type), XPTRWIDTH, fp->f_data,
-	    fp->f_flag, 0, fp->f_count, 0, XPTRWIDTH, fp->f_vnode,
+	    fp->f_flag, 0, refcount_load(&fp->f_count), 0, XPTRWIDTH, fp->f_vnode,
 	    p != NULL ? p->p_pid : -1, p != NULL ? p->p_comm : "-");
 
 #undef XPTRWIDTH
