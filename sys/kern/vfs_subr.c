@@ -1816,10 +1816,6 @@ freevnode(struct vnode *vp)
 		destroy_vpollinfo(vp->v_pollinfo);
 		vp->v_pollinfo = NULL;
 	}
-#ifdef INVARIANTS
-	/* XXX Elsewhere we detect an already freed vnode via NULL v_op. */
-	vp->v_op = NULL;
-#endif
 	vp->v_mountedhere = NULL;
 	vp->v_unpcb = NULL;
 	vp->v_rdev = NULL;
@@ -1937,7 +1933,10 @@ bufobj_invalbuf(struct bufobj *bo, int flags, int slpflag, int slptimeo)
 		}
 		if (bo->bo_dirty.bv_cnt > 0) {
 			BO_UNLOCK(bo);
-			if ((error = BO_SYNC(bo, MNT_WAIT)) != 0)
+			do {
+				error = BO_SYNC(bo, MNT_WAIT);
+			} while (error == ERELOOKUP);
+			if (error != 0)
 				return (error);
 			/*
 			 * XXX We could save a lock/unlock if this was only
@@ -3455,8 +3454,6 @@ vdrop_deactivate(struct vnode *vp)
 	 */
 	VNASSERT(!VN_IS_DOOMED(vp), vp,
 	    ("vdrop: returning doomed vnode"));
-	VNASSERT(vp->v_op != NULL, vp,
-	    ("vdrop: vnode already reclaimed."));
 	VNASSERT((vp->v_iflag & VI_OWEINACT) == 0, vp,
 	    ("vnode with VI_OWEINACT set"));
 	VNASSERT((vp->v_iflag & VI_DEFINACT) == 0, vp,
@@ -3678,7 +3675,9 @@ loop:
 				vm_object_page_clean(vp->v_object, 0, 0, 0);
 				VM_OBJECT_WUNLOCK(vp->v_object);
 			}
-			error = VOP_FSYNC(vp, MNT_WAIT, td);
+			do {
+				error = VOP_FSYNC(vp, MNT_WAIT, td);
+			} while (error == ERELOOKUP);
 			if (error != 0) {
 				VOP_UNLOCK(vp);
 				vdrop(vp);
@@ -4075,8 +4074,9 @@ vn_printf(struct vnode *vp, const char *fmt, ...)
 	if (vp->v_vflag & VV_READLINK)
 		strlcat(buf, "|VV_READLINK", sizeof(buf));
 	flags = vp->v_vflag & ~(VV_ROOT | VV_ISTTY | VV_NOSYNC | VV_ETERNALDEV |
-	    VV_CACHEDLABEL | VV_COPYONWRITE | VV_SYSTEM | VV_PROCDEP |
-	    VV_NOKNOTE | VV_DELETED | VV_MD | VV_FORCEINSMQ);
+	    VV_CACHEDLABEL | VV_VMSIZEVNLOCK | VV_COPYONWRITE | VV_SYSTEM |
+	    VV_PROCDEP | VV_NOKNOTE | VV_DELETED | VV_MD | VV_FORCEINSMQ |
+	    VV_READLINK);
 	if (flags != 0) {
 		snprintf(buf2, sizeof(buf2), "|VV(0x%lx)", flags);
 		strlcat(buf, buf2, sizeof(buf));
@@ -4104,9 +4104,10 @@ vn_printf(struct vnode *vp, const char *fmt, ...)
 		snprintf(buf2, sizeof(buf2), "|VMP(0x%lx)", flags);
 		strlcat(buf, buf2, sizeof(buf));
 	}
-	printf("    flags (%s)\n", buf + 1);
+	printf("    flags (%s)", buf + 1);
 	if (mtx_owned(VI_MTX(vp)))
 		printf(" VI_LOCKed");
+	printf("\n");
 	if (vp->v_object != NULL)
 		printf("    v_object %p ref %d pages %d "
 		    "cleanbuf %d dirtybuf %d\n",

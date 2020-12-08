@@ -65,6 +65,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/smp.h>
 #include <sys/stack.h>
 #include <sys/stat.h>
+#include <sys/dtrace_bsd.h>
 #include <sys/sysctl.h>
 #include <sys/filedesc.h>
 #include <sys/tty.h>
@@ -207,6 +208,9 @@ proc_ctor(void *mem, int size, void *arg, int flags)
 	struct thread *td;
 
 	p = (struct proc *)mem;
+#ifdef KDTRACE_HOOKS
+	kdtrace_proc_ctor(p);
+#endif
 	EVENTHANDLER_DIRECT_INVOKE(process_ctor, p);
 	td = FIRST_THREAD_IN_PROC(p);
 	if (td != NULL) {
@@ -243,6 +247,9 @@ proc_dtor(void *mem, int size, void *arg)
 		EVENTHANDLER_DIRECT_INVOKE(thread_dtor, td);
 	}
 	EVENTHANDLER_DIRECT_INVOKE(process_dtor, p);
+#ifdef KDTRACE_HOOKS
+	kdtrace_proc_dtor(p);
+#endif
 	if (p->p_ksi != NULL)
 		KASSERT(! KSI_ONQ(p->p_ksi), ("SIGCHLD queue"));
 }
@@ -774,7 +781,8 @@ pgdelete(struct pgrp *pgrp)
 
 	/*
 	 * Reset any sigio structures pointing to us as a result of
-	 * F_SETOWN with our pgid.
+	 * F_SETOWN with our pgid.  The proctree lock ensures that
+	 * new sigio structures will not be added after this point.
 	 */
 	funsetownlst(&pgrp->pg_sigiolst);
 
@@ -1143,6 +1151,7 @@ fill_kinfo_proc_only(struct proc *p, struct kinfo_proc *kp)
 	kp->ki_traceflag = p->p_traceflag;
 #endif
 	kp->ki_fd = p->p_fd;
+	kp->ki_pd = p->p_pd;
 	kp->ki_vmspace = p->p_vmspace;
 	kp->ki_flag = p->p_flag;
 	kp->ki_flag2 = p->p_flag2;
@@ -2748,7 +2757,6 @@ sysctl_kern_proc_kstack(SYSCTL_HANDLER_ARGS)
 	struct stack *st;
 	struct sbuf sb;
 	struct proc *p;
-	bool locked;
 
 	name = (int *)arg1;
 	error = pget((pid_t)name[0], PGET_NOTINEXEC | PGET_WANTREAD, &p);
@@ -2789,14 +2797,12 @@ sysctl_kern_proc_kstack(SYSCTL_HANDLER_ARGS)
 		i++;
 	}
 	PROC_UNLOCK(p);
-	locked = false;
 	numthreads = i;
 	for (i = 0; i < numthreads; i++) {
 		td = tdfind(lwpidarray[i], p->p_pid);
 		if (td == NULL) {
 			continue;
 		}
-		locked = true;
 		bzero(kkstp, sizeof(*kkstp));
 		(void)sbuf_new(&sb, kkstp->kkst_trace,
 		    sizeof(kkstp->kkst_trace), SBUF_FIXEDLEN);
@@ -2810,7 +2816,6 @@ sysctl_kern_proc_kstack(SYSCTL_HANDLER_ARGS)
 			kkstp->kkst_state = KKST_STATE_RUNNING;
 		thread_unlock(td);
 		PROC_UNLOCK(p);
-		locked = false;
 		stack_sbuf_print(&sb, st);
 		sbuf_finish(&sb);
 		sbuf_delete(&sb);
@@ -2818,10 +2823,7 @@ sysctl_kern_proc_kstack(SYSCTL_HANDLER_ARGS)
 		if (error)
 			break;
 	}
-	if (!locked)
-		PROC_LOCK(p);
-	_PRELE(p);
-	PROC_UNLOCK(p);
+	PRELE(p);
 	if (lwpidarray != NULL)
 		free(lwpidarray, M_TEMP);
 	stack_destroy(st);
@@ -2973,7 +2975,7 @@ sysctl_kern_proc_umask(SYSCTL_HANDLER_ARGS)
 	u_int namelen = arg2;
 	struct proc *p;
 	int error;
-	u_short fd_cmask;
+	u_short cmask;
 	pid_t pid;
 
 	if (namelen != 1)
@@ -2982,7 +2984,7 @@ sysctl_kern_proc_umask(SYSCTL_HANDLER_ARGS)
 	pid = (pid_t)name[0];
 	p = curproc;
 	if (pid == p->p_pid || pid == 0) {
-		fd_cmask = p->p_fd->fd_cmask;
+		cmask = p->p_pd->pd_cmask;
 		goto out;
 	}
 
@@ -2990,10 +2992,10 @@ sysctl_kern_proc_umask(SYSCTL_HANDLER_ARGS)
 	if (error != 0)
 		return (error);
 
-	fd_cmask = p->p_fd->fd_cmask;
+	cmask = p->p_pd->pd_cmask;
 	PRELE(p);
 out:
-	error = SYSCTL_OUT(req, &fd_cmask, sizeof(fd_cmask));
+	error = SYSCTL_OUT(req, &cmask, sizeof(cmask));
 	return (error);
 }
 
