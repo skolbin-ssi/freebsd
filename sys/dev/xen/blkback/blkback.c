@@ -2893,10 +2893,31 @@ xbb_connect_ring(struct xbb_softc *xbb)
 	     ring_idx < xbb->ring_config.ring_pages;
 	     ring_idx++, gnt++) {
 		if (gnt->status != 0) {
+			struct gnttab_unmap_grant_ref unmap[XBB_MAX_RING_PAGES];
+			unsigned int i, j;
+
 			xbb->ring_config.va = 0;
 			xenbus_dev_fatal(xbb->dev, EACCES,
 					 "Ring shared page mapping failed. "
 					 "Status %d.", gnt->status);
+
+			/* Unmap everything to avoid leaking grant table maps */
+			for (i = 0, j = 0; i < xbb->ring_config.ring_pages;
+			    i++) {
+				if (gnts[i].status != GNTST_okay)
+					continue;
+
+				unmap[j].host_addr = gnts[i].host_addr;
+				unmap[j].dev_bus_addr = gnts[i].dev_bus_addr;
+				unmap[j++].handle = gnts[i].handle;
+			}
+			if (j != 0) {
+				error = HYPERVISOR_grant_table_op(
+				    GNTTABOP_unmap_grant_ref, unmap, j);
+				if (error != 0)
+					panic("Unable to unmap grants (%d)",
+					    error);
+			}
 			return (EACCES);
 		}
 		xbb->ring_config.handle[ring_idx]   = gnt->handle;
@@ -3746,6 +3767,12 @@ xbb_attach(device_t dev)
 	xbb->hotplug_watch.callback = xbb_attach_disk;
 	KASSERT(xbb->hotplug_watch.node == NULL, ("watch node already setup"));
 	xbb->hotplug_watch.node = strdup(sbuf_data(watch_path), M_XENBLOCKBACK);
+	/*
+	 * We don't care about the path updated, just about the value changes
+	 * on that single node, hence there's no need to queue more that one
+	 * event.
+	 */
+	xbb->hotplug_watch.max_pending = 1;
 	sbuf_delete(watch_path);
 	error = xs_register_watch(&xbb->hotplug_watch);
 	if (error != 0) {

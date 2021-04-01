@@ -118,7 +118,7 @@ linux_execve(struct thread *td, struct linux_execve_args *args)
 }
 
 int
-linux_set_upcall_kse(struct thread *td, register_t stack)
+linux_set_upcall(struct thread *td, register_t stack)
 {
 
 	if (stack)
@@ -136,7 +136,7 @@ int
 linux_mmap2(struct thread *td, struct linux_mmap2_args *args)
 {
 
-	return (linux_mmap_common(td, PTROUT(args->addr), args->len, args->prot,
+	return (linux_mmap_common(td, args->addr, args->len, args->prot,
 		args->flags, args->fd, args->pgoff));
 }
 
@@ -144,14 +144,14 @@ int
 linux_mprotect(struct thread *td, struct linux_mprotect_args *uap)
 {
 
-	return (linux_mprotect_common(td, PTROUT(uap->addr), uap->len, uap->prot));
+	return (linux_mprotect_common(td, uap->addr, uap->len, uap->prot));
 }
 
 int
 linux_madvise(struct thread *td, struct linux_madvise_args *uap)
 {
 
-	return (linux_madvise_common(td, PTROUT(uap->addr), uap->len, uap->behav));
+	return (linux_madvise_common(td, uap->addr, uap->len, uap->behav));
 }
 
 int
@@ -251,7 +251,7 @@ linux_arch_prctl(struct thread *td, struct linux_arch_prctl_args *args)
 	switch (args->code) {
 	case LINUX_ARCH_SET_GS:
 		if (args->addr < VM_MAXUSER_ADDRESS) {
-			set_pcb_flags(pcb, PCB_FULL_IRET);
+			update_pcb_bases(pcb);
 			pcb->pcb_gsbase = args->addr;
 			td->td_frame->tf_gs = _ugssel;
 			error = 0;
@@ -260,7 +260,7 @@ linux_arch_prctl(struct thread *td, struct linux_arch_prctl_args *args)
 		break;
 	case LINUX_ARCH_SET_FS:
 		if (args->addr < VM_MAXUSER_ADDRESS) {
-			set_pcb_flags(pcb, PCB_FULL_IRET);
+			update_pcb_bases(pcb);
 			pcb->pcb_fsbase = args->addr;
 			td->td_frame->tf_fs = _ufssel;
 			error = 0;
@@ -290,6 +290,7 @@ linux_set_cloned_tls(struct thread *td, void *desc)
 		return (EPERM);
 
 	pcb = td->td_pcb;
+	update_pcb_bases(pcb);
 	pcb->pcb_fsbase = (register_t)desc;
 	td->td_frame->tf_fs = _ufssel;
 

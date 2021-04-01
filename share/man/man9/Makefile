@@ -425,6 +425,7 @@ MAN=	accept_filter.9 \
 	VOP_PATHCONF.9 \
 	VOP_PRINT.9 \
 	VOP_RDWR.9 \
+	VOP_READ_PGCACHE.9 \
 	VOP_READDIR.9 \
 	VOP_READLINK.9 \
 	VOP_REALLOCBLKS.9 \
@@ -441,6 +442,7 @@ MAN=	accept_filter.9 \
 	vrele.9 \
 	vslock.9 \
 	watchdog.9 \
+	zero_region.9 \
 	zone.9
 
 MLINKS=	unr.9 alloc_unr.9 \
@@ -611,6 +613,7 @@ MLINKS+=bitset.9 BITSET_DEFINE.9 \
 	bitset.9 BIT_EMPTY.9 \
 	bitset.9 BIT_ISFULLSET.9 \
 	bitset.9 BIT_FFS.9 \
+	bitset.9 BIT_FFS_AT.9 \
 	bitset.9 BIT_FLS.9 \
 	bitset.9 BIT_COUNT.9 \
 	bitset.9 BIT_SUBSET.9 \
@@ -627,6 +630,8 @@ MLINKS+=bitset.9 BITSET_DEFINE.9 \
 	bitset.9 BIT_CLR_ATOMIC.9 \
 	bitset.9 BIT_SET_ATOMIC.9 \
 	bitset.9 BIT_SET_ATOMIC_ACQ.9 \
+	bitset.9 BIT_TEST_SET_ATOMIC.9 \
+	bitset.9 BIT_TEST_CLR_ATOMIC.9 \
 	bitset.9 BIT_AND_ATOMIC.9 \
 	bitset.9 BIT_OR_ATOMIC.9 \
 	bitset.9 BIT_COPY_STORE_REL.9
@@ -854,6 +859,7 @@ MLINKS+=condvar.9 cv_broadcast.9 \
 	condvar.9 cv_wait_unlock.9 \
 	condvar.9 cv_wmesg.9
 MLINKS+=config_intrhook.9 config_intrhook_disestablish.9 \
+	config_intrhook.9 config_intrhook_drain.9 \
 	config_intrhook.9 config_intrhook_establish.9 \
 	config_intrhook.9 config_intrhook_oneshot.9
 MLINKS+=contigmalloc.9 contigmalloc_domainset.9 \
@@ -1386,6 +1392,7 @@ MLINKS+=make_dev.9 destroy_dev.9 \
 MLINKS+=malloc.9 free.9 \
 	malloc.9 malloc_domainset.9 \
 	malloc.9 mallocarray.9 \
+	malloc.9 mallocarray_domainset.9 \
 	malloc.9 MALLOC_DECLARE.9 \
 	malloc.9 MALLOC_DEFINE.9 \
 	malloc.9 realloc.9 \

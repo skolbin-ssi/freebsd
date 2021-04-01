@@ -119,7 +119,7 @@ static void linkmap_delete(Obj_Entry *);
 static void load_filtees(Obj_Entry *, int flags, RtldLockState *);
 static void unload_filtees(Obj_Entry *, RtldLockState *);
 static int load_needed_objects(Obj_Entry *, int);
-static int load_preload_objects(void);
+static int load_preload_objects(char *, bool);
 static Obj_Entry *load_object(const char *, int fd, const Obj_Entry *, int);
 static void map_stacks_exec(RtldLockState *);
 static int obj_disable_relro(Obj_Entry *);
@@ -210,6 +210,8 @@ static char *ld_library_path;	/* Environment variable for search path */
 static char *ld_library_dirs;	/* Environment variable for library descriptors */
 static char *ld_preload;	/* Environment variable for libraries to
 				   load first */
+static char *ld_preload_fds;	/* Environment variable for libraries represented by
+				   descriptors */
 static const char *ld_elf_hints_path;	/* Environment variable for alternative hints path */
 static const char *ld_tracing;	/* Called from ldd to print libs */
 static char *ld_utrace;		/* Use utrace() to log events. */
@@ -564,7 +566,7 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 
     ld_bind_now = getenv(_LD("BIND_NOW"));
 
-    /* 
+    /*
      * If the process is tainted, then we un-set the dangerous environment
      * variables.  The process will be marked as tainted until setuid(2)
      * is called.  If any child process calls setuid(2) we do not want any
@@ -575,7 +577,8 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 	    unsetenv(_LD("LIBRARY_PATH")) || unsetenv(_LD("LIBRARY_PATH_FDS")) ||
 	    unsetenv(_LD("LIBMAP_DISABLE")) || unsetenv(_LD("BIND_NOT")) ||
 	    unsetenv(_LD("DEBUG")) || unsetenv(_LD("ELF_HINTS_PATH")) ||
-	    unsetenv(_LD("LOADFLTR")) || unsetenv(_LD("LIBRARY_PATH_RPATH"))) {
+	    unsetenv(_LD("LOADFLTR")) || unsetenv(_LD("LIBRARY_PATH_RPATH")) ||
+	    unsetenv(_LD("PRELOAD_FDS"))) {
 		_rtld_error("environment corrupt; aborting");
 		rtld_die();
 	}
@@ -588,6 +591,7 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     ld_library_path = getenv(_LD("LIBRARY_PATH"));
     ld_library_dirs = getenv(_LD("LIBRARY_PATH_FDS"));
     ld_preload = getenv(_LD("PRELOAD"));
+    ld_preload_fds = getenv(_LD("PRELOAD_FDS"));
     ld_elf_hints_path = getenv(_LD("ELF_HINTS_PATH"));
     ld_loadfltr = getenv(_LD("LOADFLTR")) != NULL;
     library_path_rpath = getenv(_LD("LIBRARY_PATH_RPATH"));
@@ -702,8 +706,12 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     if (!libmap_disable)
         libmap_disable = (bool)lm_init(libmap_override);
 
+    dbg("loading LD_PRELOAD_FDS libraries");
+    if (load_preload_objects(ld_preload_fds, true) == -1)
+	rtld_die();
+
     dbg("loading LD_PRELOAD libraries");
-    if (load_preload_objects() == -1)
+    if (load_preload_objects(ld_preload, false) == -1)
 	rtld_die();
     preload_tail = globallist_curr(TAILQ_LAST(&obj_list, obj_entry_q));
 
@@ -803,12 +811,6 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 	    obj_main->fini_array = (Elf_Addr)NULL;
     }
 
-    /*
-     * Execute MD initializers required before we call the objects'
-     * init functions.
-     */
-    pre_init();
-
     if (direct_exec) {
 	/* Set osrel for direct-execed binary */
 	mib[0] = CTL_KERN;
@@ -900,8 +902,10 @@ _rtld_bind(Obj_Entry *obj, Elf_Size reloff)
 	target = (Elf_Addr)(defobj->relocbase + def->st_value);
 
     dbg("\"%s\" in \"%s\" ==> %p in \"%s\"",
-      defobj->strtab + def->st_name, basename(obj->path),
-      (void *)target, basename(defobj->path));
+      defobj->strtab + def->st_name,
+      obj->path == NULL ? NULL : basename(obj->path),
+      (void *)target,
+      defobj->path == NULL ? NULL : basename(defobj->path));
 
     /*
      * Write the new contents for the jmpslot. Note that depending on
@@ -2472,32 +2476,44 @@ load_needed_objects(Obj_Entry *first, int flags)
 }
 
 static int
-load_preload_objects(void)
+load_preload_objects(char *p, bool isfd)
 {
-    char *p = ld_preload;
-    Obj_Entry *obj;
-    static const char delim[] = " \t:;";
+	Obj_Entry *obj;
+	static const char delim[] = " \t:;";
 
-    if (p == NULL)
-	return 0;
+	if (p == NULL)
+		return (0);
 
-    p += strspn(p, delim);
-    while (*p != '\0') {
-	size_t len = strcspn(p, delim);
-	char savech;
-
-	savech = p[len];
-	p[len] = '\0';
-	obj = load_object(p, -1, NULL, 0);
-	if (obj == NULL)
-	    return -1;	/* XXX - cleanup */
-	obj->z_interpose = true;
-	p[len] = savech;
-	p += len;
 	p += strspn(p, delim);
-    }
-    LD_UTRACE(UTRACE_PRELOAD_FINISHED, NULL, NULL, 0, 0, NULL);
-    return 0;
+	while (*p != '\0') {
+		const char *name;
+		size_t len = strcspn(p, delim);
+		char savech;
+		int fd;
+
+		savech = p[len];
+		p[len] = '\0';
+		if (isfd) {
+			name = NULL;
+			fd = parse_integer(p);
+			if (fd == -1)
+				return (-1);
+		} else {
+			name = p;
+			fd = -1;
+		}
+
+		obj = load_object(name, fd, NULL, 0);
+		if (obj == NULL)
+			return (-1);	/* XXX - cleanup */
+		obj->z_interpose = true;
+		p[len] = savech;
+		p += len;
+		p += strspn(p, delim);
+	}
+	LD_UTRACE(UTRACE_PRELOAD_FINISHED, NULL, NULL, 0, 0, NULL);
+
+	return (0);
 }
 
 static const char *
@@ -2988,7 +3004,8 @@ reloc_textrel_prot(Obj_Entry *obj, bool before)
 		base = obj->relocbase + trunc_page(ph->p_vaddr);
 		sz = round_page(ph->p_vaddr + ph->p_filesz) -
 		    trunc_page(ph->p_vaddr);
-		prot = convert_prot(ph->p_flags) | (before ? PROT_WRITE : 0);
+		prot = before ? (PROT_READ | PROT_WRITE) :
+		    convert_prot(ph->p_flags);
 		if (mprotect(base, sz, prot) == -1) {
 			_rtld_error("%s: Cannot write-%sable text segment: %s",
 			    obj->path, before ? "en" : "dis",

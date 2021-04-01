@@ -147,8 +147,8 @@ SYSCTL_UINT(_net_inet_tcp_hostcache, OID_AUTO, bucketlimit,
     CTLFLAG_VNET | CTLFLAG_RDTUN, &VNET_NAME(tcp_hostcache.bucket_limit), 0,
     "Per-bucket hash limit for hostcache");
 
-SYSCTL_UINT(_net_inet_tcp_hostcache, OID_AUTO, count, CTLFLAG_VNET | CTLFLAG_RD,
-     &VNET_NAME(tcp_hostcache.cache_count), 0,
+SYSCTL_COUNTER_U64(_net_inet_tcp_hostcache, OID_AUTO, count, CTLFLAG_VNET | CTLFLAG_RD,
+     &VNET_NAME(tcp_hostcache.cache_count),
     "Current number of entries in hostcache");
 
 SYSCTL_INT(_net_inet_tcp_hostcache, OID_AUTO, expire, CTLFLAG_VNET | CTLFLAG_RW,
@@ -199,7 +199,8 @@ tcp_hc_init(void)
 	/*
 	 * Initialize hostcache structures.
 	 */
-	V_tcp_hostcache.cache_count = 0;
+	V_tcp_hostcache.cache_count = counter_u64_alloc(M_WAITOK);
+	counter_u64_zero(V_tcp_hostcache.cache_count);
 	V_tcp_hostcache.hashsize = TCP_HOSTCACHE_HASHSIZE;
 	V_tcp_hostcache.bucket_limit = TCP_HOSTCACHE_BUCKETLIMIT;
 	V_tcp_hostcache.expire = TCP_HOSTCACHE_EXPIRE;
@@ -266,6 +267,9 @@ tcp_hc_destroy(void)
 
 	/* Purge all hc entries. */
 	tcp_hc_purge_internal(1);
+
+	/* Release the counter */
+	counter_u64_free(V_tcp_hostcache.cache_count);
 
 	/* Free the uma zone and the allocated hash table. */
 	uma_zdestroy(V_tcp_hostcache.zone);
@@ -374,7 +378,7 @@ tcp_hc_insert(struct in_conninfo *inc)
 	 * If the bucket limit is reached, reuse the least-used element.
 	 */
 	if (hc_head->hch_length >= V_tcp_hostcache.bucket_limit ||
-	    V_tcp_hostcache.cache_count >= V_tcp_hostcache.cache_limit) {
+	    counter_u64_fetch(V_tcp_hostcache.cache_count) >= V_tcp_hostcache.cache_limit) {
 		hc_entry = TAILQ_LAST(&hc_head->hch_bucket, hc_qhead);
 		/*
 		 * At first we were dropping the last element, just to
@@ -391,7 +395,7 @@ tcp_hc_insert(struct in_conninfo *inc)
 		}
 		TAILQ_REMOVE(&hc_head->hch_bucket, hc_entry, rmx_q);
 		V_tcp_hostcache.hashbase[hash].hch_length--;
-		V_tcp_hostcache.cache_count--;
+		counter_u64_add(V_tcp_hostcache.cache_count, -1);
 		TCPSTAT_INC(tcps_hc_bucketoverflow);
 #if 0
 		uma_zfree(V_tcp_hostcache.zone, hc_entry);
@@ -424,7 +428,7 @@ tcp_hc_insert(struct in_conninfo *inc)
 	 */
 	TAILQ_INSERT_HEAD(&hc_head->hch_bucket, hc_entry, rmx_q);
 	V_tcp_hostcache.hashbase[hash].hch_length++;
-	V_tcp_hostcache.cache_count++;
+	counter_u64_add(V_tcp_hostcache.cache_count, 1);
 	TCPSTAT_INC(tcps_hc_added);
 
 	return hc_entry;
@@ -628,7 +632,7 @@ sysctl_tcp_hc_list(SYSCTL_HANDLER_ARGS)
 {
 	const int linesize = 128;
 	struct sbuf sb;
-	int i, error;
+	int i, error, len;
 	struct hc_metrics *hc_entry;
 	char ip4buf[INET_ADDRSTRLEN];
 #ifdef INET6
@@ -638,12 +642,24 @@ sysctl_tcp_hc_list(SYSCTL_HANDLER_ARGS)
 	if (jailed_without_vnet(curthread->td_ucred) != 0)
 		return (EPERM);
 
-	sbuf_new(&sb, NULL, linesize * (V_tcp_hostcache.cache_count + 1),
-		SBUF_INCLUDENUL);
+	/* Optimize Buffer length query by sbin/sysctl */
+	if (req->oldptr == NULL) {
+		len = (counter_u64_fetch(V_tcp_hostcache.cache_count) + 1) * linesize;
+		return (SYSCTL_OUT(req, NULL, len));
+	}
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0) {
+		return(error);
+	}
+
+	/* Use a buffer sized for one full bucket */
+	sbuf_new_for_sysctl(&sb, NULL, V_tcp_hostcache.bucket_limit * linesize, req);
 
 	sbuf_printf(&sb,
-	        "\nIP address        MTU  SSTRESH      RTT   RTTVAR "
+		"\nIP address        MTU  SSTRESH      RTT   RTTVAR "
 		"    CWND SENDPIPE RECVPIPE HITS  UPD  EXP\n");
+	sbuf_drain(&sb);
 
 #define msec(u) (((u) + 500) / 1000)
 	for (i = 0; i < V_tcp_hostcache.hashsize; i++) {
@@ -674,11 +690,10 @@ sysctl_tcp_hc_list(SYSCTL_HANDLER_ARGS)
 			    hc_entry->rmx_expire);
 		}
 		THC_UNLOCK(&V_tcp_hostcache.hashbase[i].hch_mtx);
+		sbuf_drain(&sb);
 	}
 #undef msec
 	error = sbuf_finish(&sb);
-	if (error == 0)
-		error = SYSCTL_OUT(req, sbuf_data(&sb), sbuf_len(&sb));
 	sbuf_delete(&sb);
 	return(error);
 }
@@ -701,7 +716,7 @@ tcp_hc_purge_internal(int all)
 					      hc_entry, rmx_q);
 				uma_zfree(V_tcp_hostcache.zone, hc_entry);
 				V_tcp_hostcache.hashbase[i].hch_length--;
-				V_tcp_hostcache.cache_count--;
+				counter_u64_add(V_tcp_hostcache.cache_count, -1);
 			} else
 				hc_entry->rmx_expire -= V_tcp_hostcache.prune;
 		}

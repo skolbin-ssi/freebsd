@@ -115,7 +115,7 @@ struct sackhint {
 					 */
 	uint32_t	recover_fs;	/* Flight Size at the start of Loss recovery */
 	uint32_t	prr_delivered;	/* Total bytes delivered using PRR */
-	uint32_t	_pad[1];	/* TBD */
+	uint32_t	prr_out;	/* Bytes sent during IN_RECOVERY */
 };
 
 #define SEGQ_EMPTY(tp) TAILQ_EMPTY(&(tp)->t_segq)
@@ -840,6 +840,7 @@ VNET_DECLARE(int, tcp_do_autosndbuf);
 VNET_DECLARE(int, tcp_do_ecn);
 VNET_DECLARE(int, tcp_do_newcwv);
 VNET_DECLARE(int, tcp_do_rfc1323);
+VNET_DECLARE(int, tcp_tolerate_missing_ts);
 VNET_DECLARE(int, tcp_do_rfc3042);
 VNET_DECLARE(int, tcp_do_rfc3390);
 VNET_DECLARE(int, tcp_do_rfc3465);
@@ -883,6 +884,7 @@ VNET_DECLARE(struct inpcbinfo, tcbinfo);
 #define	V_tcp_do_autosndbuf		VNET(tcp_do_autosndbuf)
 #define	V_tcp_do_ecn			VNET(tcp_do_ecn)
 #define	V_tcp_do_rfc1323		VNET(tcp_do_rfc1323)
+#define	V_tcp_tolerate_missing_ts	VNET(tcp_tolerate_missing_ts)
 #define V_tcp_ts_offset_per_conn	VNET(tcp_ts_offset_per_conn)
 #define	V_tcp_do_rfc3042		VNET(tcp_do_rfc3042)
 #define	V_tcp_do_rfc3390		VNET(tcp_do_rfc3390)
@@ -982,6 +984,13 @@ extern counter_u64_t tcp_inp_lro_compressed;
 extern counter_u64_t tcp_inp_lro_single_push;
 extern counter_u64_t tcp_inp_lro_locks_taken;
 extern counter_u64_t tcp_inp_lro_sack_wake;
+extern counter_u64_t tcp_extra_mbuf;
+extern counter_u64_t tcp_would_have_but;
+extern counter_u64_t tcp_comp_total;
+extern counter_u64_t tcp_uncomp_total;
+extern counter_u64_t tcp_csum_hardware;
+extern counter_u64_t tcp_csum_hardware_w_ph;
+extern counter_u64_t tcp_csum_software;
 
 #ifdef NETFLIX_EXP_DETECTION
 /* Various SACK attack thresholds */
@@ -1054,7 +1063,7 @@ void	 tcp_clean_dsack_blocks(struct tcpcb *tp);
 void	 tcp_clean_sackreport(struct tcpcb *tp);
 void	 tcp_sack_adjust(struct tcpcb *tp);
 struct sackhole *tcp_sack_output(struct tcpcb *tp, int *sack_bytes_rexmt);
-void	 tcp_prr_partialack(struct tcpcb *, struct tcphdr *);
+void	 tcp_do_prr_ack(struct tcpcb *, struct tcphdr *);
 void	 tcp_sack_partialack(struct tcpcb *, struct tcphdr *);
 void	 tcp_free_sackholes(struct tcpcb *tp);
 int	 tcp_newreno(struct tcpcb *, struct tcphdr *);

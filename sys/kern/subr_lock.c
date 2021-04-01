@@ -40,6 +40,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/ktr.h>
+#include <sys/limits.h>
 #include <sys/lock.h>
 #include <sys/lock_profile.h>
 #include <sys/malloc.h>
@@ -127,10 +128,6 @@ lock_delay(struct lock_delay_arg *la)
 	struct lock_delay_config *lc = la->config;
 	u_short i;
 
-	la->delay <<= 1;
-	if (__predict_false(la->delay > lc->max))
-		la->delay = lc->max;
-
 	for (i = la->delay; i > 0; i--)
 		cpu_spinwait();
 
@@ -140,6 +137,10 @@ lock_delay(struct lock_delay_arg *la)
 		if (restrict_starvation)
 			la->delay = lc->base;
 	}
+
+	la->delay <<= 1;
+	if (__predict_false(la->delay > lc->max))
+		la->delay = lc->max;
 }
 
 static u_int

@@ -193,7 +193,19 @@ radix_tlbie(uint8_t ric, uint8_t prs, uint16_t is, uint32_t pid, uint32_t lpid,
 	rs = ((uint64_t)pid << 32) | lpid;
 	rb = va | is | ap;
 	__asm __volatile(PPC_TLBIE_5(%0, %1, %2, %3, 1) : :
-		"r" (rb), "r" (rs), "i" (ric), "i" (prs));
+		"r" (rb), "r" (rs), "i" (ric), "i" (prs) : "memory");
+}
+
+static __inline void
+radix_tlbie_fixup(uint32_t pid, vm_offset_t va, int ap)
+{
+
+	__asm __volatile("ptesync" ::: "memory");
+	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
+	    TLBIEL_INVAL_PAGE, 0, 0, va, ap);
+	__asm __volatile("ptesync" ::: "memory");
+	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
+	    TLBIEL_INVAL_PAGE, pid, 0, va, ap);
 }
 
 static __inline void
@@ -202,6 +214,7 @@ radix_tlbie_invlpg_user_4k(uint32_t pid, vm_offset_t va)
 
 	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
 		TLBIEL_INVAL_PAGE, pid, 0, va, TLBIE_ACTUAL_PAGE_4K);
+	radix_tlbie_fixup(pid, va, TLBIE_ACTUAL_PAGE_4K);
 }
 
 static __inline void
@@ -210,6 +223,7 @@ radix_tlbie_invlpg_user_2m(uint32_t pid, vm_offset_t va)
 
 	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
 		TLBIEL_INVAL_PAGE, pid, 0, va, TLBIE_ACTUAL_PAGE_2M);
+	radix_tlbie_fixup(pid, va, TLBIE_ACTUAL_PAGE_2M);
 }
 
 static __inline void
@@ -234,6 +248,7 @@ radix_tlbie_invlpg_kernel_4k(vm_offset_t va)
 
 	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
 	    TLBIEL_INVAL_PAGE, 0, 0, va, TLBIE_ACTUAL_PAGE_4K);
+	radix_tlbie_fixup(0, va, TLBIE_ACTUAL_PAGE_4K);
 }
 
 static __inline void
@@ -242,6 +257,7 @@ radix_tlbie_invlpg_kernel_2m(vm_offset_t va)
 
 	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
 	    TLBIEL_INVAL_PAGE, 0, 0, va, TLBIE_ACTUAL_PAGE_2M);
+	radix_tlbie_fixup(0, va, TLBIE_ACTUAL_PAGE_2M);
 }
 
 /* 1GB pages aren't currently supported. */
@@ -251,6 +267,7 @@ radix_tlbie_invlpg_kernel_1g(vm_offset_t va)
 
 	radix_tlbie(TLBIE_RIC_INVALIDATE_TLB, TLBIE_PRS_PROCESS_SCOPE,
 	    TLBIEL_INVAL_PAGE, 0, 0, va, TLBIE_ACTUAL_PAGE_1G);
+	radix_tlbie_fixup(0, va, TLBIE_ACTUAL_PAGE_1G);
 }
 
 static __inline void
@@ -1199,6 +1216,7 @@ retry:
 		}
 		PV_STAT(atomic_add_int(&pc_chunk_count, 1));
 		PV_STAT(atomic_add_int(&pc_chunk_allocs, 1));
+		dump_add_page(m->phys_addr);
 		pc = (void *)PHYS_TO_DMAP(m->phys_addr);
 		pc->pc_pmap = pmap;
 		pc->pc_map[0] = PC_FREE0;
@@ -1473,6 +1491,7 @@ reclaim_pv_chunk(pmap_t locked_pmap, struct rwlock **lockp)
 			PV_STAT(atomic_add_int(&pc_chunk_frees, 1));
 			/* Entire chunk is free; return it. */
 			m_pc = PHYS_TO_VM_PAGE(DMAP_TO_PHYS((vm_offset_t)pc));
+			dump_drop_page(m_pc->phys_addr);
 			mtx_lock(&pv_chunks_mutex);
 			TAILQ_REMOVE(&pv_chunks, pc, pc_lru);
 			break;
@@ -1562,6 +1581,7 @@ free_pv_chunk(struct pv_chunk *pc)
 	PV_STAT(atomic_add_int(&pc_chunk_frees, 1));
 	/* entire chunk is free, return it */
 	m = PHYS_TO_VM_PAGE(DMAP_TO_PHYS((vm_offset_t)pc));
+	dump_drop_page(m->phys_addr);
 	vm_page_unwire_noq(m);
 	vm_page_free(m);
 }
@@ -1622,6 +1642,7 @@ retry:
 	}
 	PV_STAT(atomic_add_int(&pc_chunk_count, 1));
 	PV_STAT(atomic_add_int(&pc_chunk_allocs, 1));
+	dump_add_page(m->phys_addr);
 	pc = (void *)PHYS_TO_DMAP(m->phys_addr);
 	pc->pc_pmap = pmap;
 	pc->pc_map[0] = PC_FREE0 & ~1ul;	/* preallocated bit 0 */
@@ -2078,6 +2099,10 @@ mmu_radix_late_bootstrap(vm_offset_t start, vm_offset_t end)
 	pa = allocpages(DPCPU_SIZE >> PAGE_SHIFT);
 	dpcpu = (void *)PHYS_TO_DMAP(pa);
 	dpcpu_init(dpcpu, curcpu);
+
+	crashdumpmap = (caddr_t)virtual_avail;
+	virtual_avail += MAXDUMPPGS * PAGE_SIZE;
+
 	/*
 	 * Reserve some special page table entries/VA space for temporary
 	 * mapping of pages.
@@ -2757,6 +2782,7 @@ setpte:
 		pmap_pv_promote_l3e(pmap, va, newpde & PG_PS_FRAME, lockp);
 
 	pte_store(pde, PG_PROMOTED | newpde);
+	ptesync();
 	atomic_add_long(&pmap_l3e_promotions, 1);
 	CTR2(KTR_PMAP, "pmap_promote_l3e: success for va %#lx"
 	    " in pmap %p", va, pmap);
@@ -2787,8 +2813,7 @@ mmu_radix_enter(pmap_t pmap, vm_offset_t va, vm_page_t m,
 	CTR6(KTR_PMAP, "pmap_enter(%p, %#lx, %p, %#x, %#x, %d)", pmap, va,
 	    m, prot, flags, psind);
 	KASSERT(va <= VM_MAX_KERNEL_ADDRESS, ("pmap_enter: toobig"));
-	KASSERT((m->oflags & VPO_UNMANAGED) != 0 || va < kmi.clean_sva ||
-	    va >= kmi.clean_eva,
+	KASSERT((m->oflags & VPO_UNMANAGED) != 0 || !VA_IS_CLEANMAP(va),
 	    ("pmap_enter: managed mapping within the clean submap"));
 	if ((m->oflags & VPO_UNMANAGED) == 0)
 		VM_PAGE_OBJECT_BUSY_ASSERT(m);
@@ -3272,7 +3297,7 @@ mmu_radix_enter_quick_locked(pmap_t pmap, vm_offset_t va, vm_page_t m,
 	pt_entry_t *pte;
 	vm_paddr_t pa;
 
-	KASSERT(va < kmi.clean_sva || va >= kmi.clean_eva ||
+	KASSERT(!VA_IS_CLEANMAP(va) ||
 	    (m->oflags & VPO_UNMANAGED) != 0,
 	    ("mmu_radix_enter_quick_locked: managed mapping within the clean submap"));
 	PMAP_LOCK_ASSERT(pmap, MA_OWNED);

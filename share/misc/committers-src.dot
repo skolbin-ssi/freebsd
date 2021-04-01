@@ -157,6 +157,7 @@ dexuan [label="Dexuan Cui\ndexuan@FreeBSD.org\n2016/10/24"]
 dfr [label="Doug Rabson\ndfr@FreeBSD.org\n????/??/??"]
 dg [label="David Greenman\ndg@FreeBSD.org\n1993/06/14"]
 dim [label="Dimitry Andric\ndim@FreeBSD.org\n2010/08/30"]
+donner [label="Lutz Donnerhacke\ndonner@FreeBSD.org\n2021/01/14"]
 dougm [label="Doug Moore\ndougm@FreeBSD.org\n2019/04/30"]
 dteske [label="Devin Teske\ndteske@FreeBSD.org\n2012/04/10"]
 dumbbell [label="Jean-Sebastien Pedron\ndumbbell@FreeBSD.org\n2004/11/29"]
@@ -296,6 +297,7 @@ pkelsey [label="Patrick Kelsey\pkelsey@FreeBSD.org\n2014/05/29"]
 pluknet [label="Sergey Kandaurov\npluknet@FreeBSD.org\n2010/10/05"]
 ps [label="Paul Saab\nps@FreeBSD.org\n2000/02/23"]
 qingli [label="Qing Li\nqingli@FreeBSD.org\n2005/04/13"]
+rajeshasp [label="Rajesh Kumar M A\nrajeshasp@FreeBSD.org\n2021/01/27"]
 ram [label="Ram Kishore Vegesna\nram@FreeBSD.org\n2018/04/04"]
 ray [label="Aleksandr Rybalko\nray@FreeBSD.org\n2011/05/25"]
 rdivacky [label="Roman Divacky\nrdivacky@FreeBSD.org\n2008/03/13"]
@@ -528,6 +530,7 @@ erj -> jeb
 fjoe -> versus
 
 gallatin -> ticso
+gallatin -> rajeshasp
 
 gavin -> versus
 
@@ -705,6 +708,7 @@ kib -> zont
 
 kmacy -> lstewart
 
+kp -> donner
 kp -> nick
 
 marcel -> allanjude
@@ -778,6 +782,7 @@ peter -> jayanth
 peter -> ps
 
 philip -> benl
+philip -> donner
 philip -> ed
 philip -> jls
 philip -> matteo
@@ -897,6 +902,8 @@ ume -> tshiozak
 
 vangyzen -> badger
 vangyzen -> dab
+
+vmaffione -> rajeshasp
 
 wes -> scf
 

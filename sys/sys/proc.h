@@ -111,9 +111,11 @@ struct pgrp {
 	struct session	*pg_session;	/* (c) Pointer to session. */
 	struct sigiolst	pg_sigiolst;	/* (m) List of sigio sources. */
 	pid_t		pg_id;		/* (c) Process group id. */
-	int		pg_jobc;	/* (m) Job control process count. */
 	struct mtx	pg_mtx;		/* Mutex to protect members */
+	int		pg_flags;	/* (m) PGRP_ flags */
 };
+
+#define	PGRP_ORPHANED	0x00000001	/* Group is orphaned */
 
 /*
  * pargs, used to hold a copy of the command line, if it had a sane length.
@@ -345,6 +347,7 @@ struct thread {
 		TDS_RUNQ,
 		TDS_RUNNING
 	} td_state;			/* (t) thread state */
+	/* Note: td_state must be accessed using TD_{GET,SET}_STATE(). */
 	union {
 		register_t	tdu_retval[2];
 		off_t		tdu_off;
@@ -538,10 +541,15 @@ do {									\
 #define	TD_IS_SWAPPED(td)	((td)->td_inhibitors & TDI_SWAPPED)
 #define	TD_ON_LOCK(td)		((td)->td_inhibitors & TDI_LOCK)
 #define	TD_AWAITING_INTR(td)	((td)->td_inhibitors & TDI_IWAIT)
-#define	TD_IS_RUNNING(td)	((td)->td_state == TDS_RUNNING)
-#define	TD_ON_RUNQ(td)		((td)->td_state == TDS_RUNQ)
-#define	TD_CAN_RUN(td)		((td)->td_state == TDS_CAN_RUN)
-#define	TD_IS_INHIBITED(td)	((td)->td_state == TDS_INHIBITED)
+#ifdef _KERNEL
+#define	TD_GET_STATE(td)	atomic_load_int(&(td)->td_state)
+#else
+#define	TD_GET_STATE(td)	((td)->td_state)
+#endif
+#define	TD_IS_RUNNING(td)	(TD_GET_STATE(td) == TDS_RUNNING)
+#define	TD_ON_RUNQ(td)		(TD_GET_STATE(td) == TDS_RUNQ)
+#define	TD_CAN_RUN(td)		(TD_GET_STATE(td) == TDS_CAN_RUN)
+#define	TD_IS_INHIBITED(td)	(TD_GET_STATE(td) == TDS_INHIBITED)
 #define	TD_ON_UPILOCK(td)	((td)->td_flags & TDF_UPIBLOCKED)
 #define TD_IS_IDLETHREAD(td)	((td)->td_flags & TDF_IDLETD)
 
@@ -555,15 +563,15 @@ do {									\
 	((td)->td_inhibitors & TDI_LOCK) != 0 ? "blocked" :		\
 	((td)->td_inhibitors & TDI_IWAIT) != 0 ? "iwait" : "yielding")
 
-#define	TD_SET_INHIB(td, inhib) do {			\
-	(td)->td_state = TDS_INHIBITED;			\
-	(td)->td_inhibitors |= (inhib);			\
+#define	TD_SET_INHIB(td, inhib) do {		\
+	TD_SET_STATE(td, TDS_INHIBITED);	\
+	(td)->td_inhibitors |= (inhib);		\
 } while (0)
 
 #define	TD_CLR_INHIB(td, inhib) do {			\
 	if (((td)->td_inhibitors & (inhib)) &&		\
 	    (((td)->td_inhibitors &= ~(inhib)) == 0))	\
-		(td)->td_state = TDS_CAN_RUN;		\
+		TD_SET_STATE(td, TDS_CAN_RUN);		\
 } while (0)
 
 #define	TD_SET_SLEEPING(td)	TD_SET_INHIB((td), TDI_SLEEPING)
@@ -579,9 +587,15 @@ do {									\
 #define	TD_CLR_SUSPENDED(td)	TD_CLR_INHIB((td), TDI_SUSPENDED)
 #define	TD_CLR_IWAIT(td)	TD_CLR_INHIB((td), TDI_IWAIT)
 
-#define	TD_SET_RUNNING(td)	(td)->td_state = TDS_RUNNING
-#define	TD_SET_RUNQ(td)		(td)->td_state = TDS_RUNQ
-#define	TD_SET_CAN_RUN(td)	(td)->td_state = TDS_CAN_RUN
+#ifdef _KERNEL
+#define	TD_SET_STATE(td, state)	atomic_store_int(&(td)->td_state, state)
+#else
+#define	TD_SET_STATE(td, state)	(td)->td_state = state
+#endif
+#define	TD_SET_RUNNING(td)	TD_SET_STATE(td, TDS_RUNNING)
+#define	TD_SET_RUNQ(td)		TD_SET_STATE(td, TDS_RUNQ)
+#define	TD_SET_CAN_RUN(td)	TD_SET_STATE(td, TDS_CAN_RUN)
+
 
 #define	TD_SBDRY_INTR(td) \
     (((td)->td_flags & (TDF_SEINTR | TDF_SERESTART)) != 0)
@@ -864,7 +878,6 @@ struct proc {
 
 #ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_PARGS);
-MALLOC_DECLARE(M_PGRP);
 MALLOC_DECLARE(M_SESSION);
 MALLOC_DECLARE(M_SUBPROC);
 #endif
@@ -1022,6 +1035,7 @@ extern struct proclist allproc;		/* List of all processes. */
 extern struct proc *initproc, *pageproc; /* Process slots for init, pager. */
 
 extern struct uma_zone *proc_zone;
+extern struct uma_zone *pgrp_zone;
 
 struct	proc *pfind(pid_t);		/* Find process by id. */
 struct	proc *pfind_any(pid_t);		/* Find (zombie) process by id. */
@@ -1041,6 +1055,7 @@ struct	fork_req {
 	int 		fr_flags2;
 #define	FR2_DROPSIG_CAUGHT	0x00000001 /* Drop caught non-DFL signals */
 #define	FR2_SHARE_PATHS		0x00000002 /* Invert sense of RFFDG for paths */
+#define	FR2_KPROC		0x00000004 /* Create a kernel process */
 };
 
 /*

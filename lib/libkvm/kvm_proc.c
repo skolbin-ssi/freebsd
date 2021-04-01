@@ -273,7 +273,7 @@ kvm_proclist(kvm_t *kd, int what, int arg, struct proc *p,
 			return (-1);
 		}
 		kp->ki_pgid = pgrp.pg_id;
-		kp->ki_jobc = pgrp.pg_jobc;
+		kp->ki_jobc = -1;	/* Or calculate?  Arguably not. */
 		if (KREAD(kd, (u_long)pgrp.pg_session, &sess)) {
 			_kvm_err(kd, kd->program, "can't read session at %p",
 				pgrp.pg_session);
@@ -426,7 +426,7 @@ nopgrp:
 					    TD_CAN_RUN(&mtd) ||
 					    TD_IS_RUNNING(&mtd)) {
 						kp->ki_stat = SRUN;
-					} else if (mtd.td_state ==
+					} else if (TD_GET_STATE(&mtd) ==
 					    TDS_INHIBITED) {
 						if (P_SHOULDSTOP(&proc)) {
 							kp->ki_stat = SSTOP;

@@ -1642,9 +1642,9 @@ fail:
 }
 
 /*
- * This function is intended to be used early on in place of page_alloc() so
- * that we may use the boot time page cache to satisfy allocations before
- * the VM is ready.
+ * This function is intended to be used early on in place of page_alloc().  It
+ * performs contiguous physical memory allocations and uses a bump allocator for
+ * KVA, so is usable before the kernel map is initialized.
  */
 static void *
 startup_alloc(uma_zone_t zone, vm_size_t bytes, int domain, uint8_t *pflag,
@@ -1691,7 +1691,13 @@ startup_free(void *mem, vm_size_t bytes)
 
 	va = (vm_offset_t)mem;
 	m = PHYS_TO_VM_PAGE(pmap_kextract(va));
-	pmap_remove(kernel_pmap, va, va + bytes);
+
+	/*
+	 * startup_alloc() returns direct-mapped slabs on some platforms.  Avoid
+	 * unmapping ranges of the direct map.
+	 */
+	if (va >= bootstart && va + bytes <= bootmem)
+		pmap_remove(kernel_pmap, va, va + bytes);
 	for (; bytes != 0; bytes -= PAGE_SIZE, m++) {
 #if defined(__aarch64__) || defined(__amd64__) || defined(__mips__) || \
     defined(__riscv) || defined(__powerpc64__)
@@ -3165,6 +3171,11 @@ uma_zfree_pcpu_arg(uma_zone_t zone, void *pcpu_item, void *udata)
 #ifdef SMP
 	MPASS(zone->uz_flags & UMA_ZONE_PCPU);
 #endif
+
+        /* uma_zfree_pcu_*(..., NULL) does nothing, to match free(9). */
+        if (pcpu_item == NULL)
+                return;
+
 	item = zpcpu_offset_to_base(pcpu_item);
 	uma_zfree_arg(zone, item, udata);
 }
@@ -5392,10 +5403,10 @@ uma_dbg_alloc(uma_zone_t zone, uma_slab_t slab, void *item)
 	keg = zone->uz_keg;
 	freei = slab_item_index(slab, keg, item);
 
-	if (BIT_ISSET(keg->uk_ipers, freei, slab_dbg_bits(slab, keg)))
+	if (BIT_TEST_SET_ATOMIC(keg->uk_ipers, freei,
+	    slab_dbg_bits(slab, keg)))
 		panic("Duplicate alloc of %p from zone %p(%s) slab %p(%d)",
 		    item, zone, zone->uz_name, slab, freei);
-	BIT_SET_ATOMIC(keg->uk_ipers, freei, slab_dbg_bits(slab, keg));
 }
 
 /*
@@ -5426,11 +5437,10 @@ uma_dbg_free(uma_zone_t zone, uma_slab_t slab, void *item)
 		panic("Unaligned free of %p from zone %p(%s) slab %p(%d)",
 		    item, zone, zone->uz_name, slab, freei);
 
-	if (!BIT_ISSET(keg->uk_ipers, freei, slab_dbg_bits(slab, keg)))
+	if (!BIT_TEST_CLR_ATOMIC(keg->uk_ipers, freei,
+	    slab_dbg_bits(slab, keg)))
 		panic("Duplicate free of %p from zone %p(%s) slab %p(%d)",
 		    item, zone, zone->uz_name, slab, freei);
-
-	BIT_CLR_ATOMIC(keg->uk_ipers, freei, slab_dbg_bits(slab, keg));
 }
 #endif /* INVARIANTS */
 

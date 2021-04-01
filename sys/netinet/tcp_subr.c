@@ -256,6 +256,11 @@ SYSCTL_INT(_net_inet_tcp, TCPCTL_DO_RFC1323, rfc1323, CTLFLAG_VNET | CTLFLAG_RW,
     &VNET_NAME(tcp_do_rfc1323), 0,
     "Enable rfc1323 (high performance TCP) extensions");
 
+VNET_DEFINE(int, tcp_tolerate_missing_ts) = 0;
+SYSCTL_INT(_net_inet_tcp, OID_AUTO, tolerate_missing_ts, CTLFLAG_VNET | CTLFLAG_RW,
+    &VNET_NAME(tcp_tolerate_missing_ts), 0,
+    "Tolerate missing TCP timestamps");
+
 VNET_DEFINE(int, tcp_ts_offset_per_conn) = 1;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, ts_offset_per_conn, CTLFLAG_VNET | CTLFLAG_RW,
     &VNET_NAME(tcp_ts_offset_per_conn), 0,
@@ -736,6 +741,16 @@ tcp_default_fb_init(struct tcpcb *tp)
 		tcp_timer_activate(tp, TT_KEEP,
 		    TCPS_HAVEESTABLISHED(tp->t_state) ? TP_KEEPIDLE(tp) :
 		    TP_KEEPINIT(tp));
+
+	/*
+	 * Make sure critical variables are initialized
+	 * if transitioning while in Recovery.
+	 */
+	if IN_FASTRECOVERY(tp->t_flags) {
+		if (tp->sackhint.recover_fs == 0)
+			tp->sackhint.recover_fs = max(1,
+			    tp->snd_nxt - tp->snd_una);
+	}
 
 	return (0);
 }
@@ -1221,6 +1236,13 @@ tcp_init(void)
 	tcp_inp_lro_single_push = counter_u64_alloc(M_WAITOK);
 	tcp_inp_lro_locks_taken = counter_u64_alloc(M_WAITOK);
 	tcp_inp_lro_sack_wake = counter_u64_alloc(M_WAITOK);
+	tcp_extra_mbuf = counter_u64_alloc(M_WAITOK);
+	tcp_would_have_but = counter_u64_alloc(M_WAITOK);
+	tcp_comp_total = counter_u64_alloc(M_WAITOK);
+	tcp_uncomp_total = counter_u64_alloc(M_WAITOK);
+	tcp_csum_hardware = counter_u64_alloc(M_WAITOK);
+	tcp_csum_hardware_w_ph = counter_u64_alloc(M_WAITOK);
+	tcp_csum_software = counter_u64_alloc(M_WAITOK);
 #ifdef TCPPCAP
 	tcp_pcap_init();
 #endif

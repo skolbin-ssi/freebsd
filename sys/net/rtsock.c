@@ -70,6 +70,7 @@
 #include <netinet/if_ether.h>
 #include <netinet/ip_carp.h>
 #ifdef INET6
+#include <netinet6/in6_var.h>
 #include <netinet6/ip6_var.h>
 #include <netinet6/scope6_var.h>
 #endif
@@ -173,6 +174,7 @@ static int	rtsock_msg_buffer(int type, struct rt_addrinfo *rtinfo,
 			struct walkarg *w, int *plen);
 static int	rt_xaddrs(caddr_t cp, caddr_t cplim,
 			struct rt_addrinfo *rtinfo);
+static int	cleanup_xaddrs(struct rt_addrinfo *info);
 static int	sysctl_dumpentry(struct rtentry *rt, void *vw);
 static int	sysctl_dumpnhop(struct rtentry *rt, struct nhop_object *nh,
 			uint32_t weight, struct walkarg *w);
@@ -562,6 +564,54 @@ rtm_get_jailed(struct rt_addrinfo *info, struct ifnet *ifp,
 	return (0);
 }
 
+static int
+fill_blackholeinfo(struct rt_addrinfo *info, union sockaddr_union *saun)
+{
+	struct ifaddr *ifa;
+	sa_family_t saf;
+
+	if (V_loif == NULL) {
+		printf("Unable to add blackhole/reject nhop without loopback");
+		return (ENOTSUP);
+	}
+	info->rti_ifp = V_loif;
+
+	saf = info->rti_info[RTAX_DST]->sa_family;
+
+	CK_STAILQ_FOREACH(ifa, &info->rti_ifp->if_addrhead, ifa_link) {
+		if (ifa->ifa_addr->sa_family == saf) {
+			info->rti_ifa = ifa;
+			break;
+		}
+	}
+	if (info->rti_ifa == NULL)
+		return (ENOTSUP);
+
+	bzero(saun, sizeof(union sockaddr_union));
+	switch (saf) {
+#ifdef INET
+	case AF_INET:
+		saun->sin.sin_family = AF_INET;
+		saun->sin.sin_len = sizeof(struct sockaddr_in);
+		saun->sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		break;
+#endif
+#ifdef INET6
+	case AF_INET6:
+		saun->sin6.sin6_family = AF_INET6;
+		saun->sin6.sin6_len = sizeof(struct sockaddr_in6);
+		saun->sin6.sin6_addr = in6addr_loopback;
+		break;
+#endif
+	default:
+		return (ENOTSUP);
+	}
+	info->rti_info[RTAX_GATEWAY] = &saun->sa;
+	info->rti_flags |= RTF_GATEWAY;
+
+	return (0);
+}
+
 /*
  * Fills in @info based on userland-provided @rtm message.
  *
@@ -587,14 +637,10 @@ fill_addrinfo(struct rt_msghdr *rtm, int len, u_int fibnum, struct rt_addrinfo *
 	if (rt_xaddrs((caddr_t)(rtm + 1), len + (caddr_t)rtm, info))
 		return (EINVAL);
 
-	if (rtm->rtm_flags & RTF_RNH_LOCKED)
-		return (EINVAL);
 	info->rti_flags = rtm->rtm_flags;
-	if (info->rti_info[RTAX_DST] == NULL ||
-	    info->rti_info[RTAX_DST]->sa_family >= AF_MAX ||
-	    (info->rti_info[RTAX_GATEWAY] != NULL &&
-	     info->rti_info[RTAX_GATEWAY]->sa_family >= AF_MAX))
-		return (EINVAL);
+	error = cleanup_xaddrs(info);
+	if (error != 0)
+		return (error);
 	saf = info->rti_info[RTAX_DST]->sa_family;
 	/*
 	 * Verify that the caller has the appropriate privilege; RTM_GET
@@ -693,7 +739,14 @@ handle_rtm_get(struct rt_addrinfo *info, u_int fibnum,
 
 	RIB_RLOCK(rnh);
 
-	if (info->rti_info[RTAX_NETMASK] == NULL) {
+	/*
+	 * By (implicit) convention host route (one without netmask)
+	 * means longest-prefix-match request and the route with netmask
+	 * means exact-match lookup.
+	 * As cleanup_xaddrs() cleans up info flags&addrs for the /32,/128
+	 * prefixes, use original data to check for the netmask presence.
+	 */
+	if ((rtm->rtm_addrs & RTA_NETMASK) == 0) {
 		/*
 		 * Provide longest prefix match for
 		 * address lookup (no mask).
@@ -799,11 +852,11 @@ static void
 export_rtaddrs(const struct rtentry *rt, struct sockaddr *dst,
     struct sockaddr *mask)
 {
-	uint32_t scopeid = 0;
 #ifdef INET
 	if (dst->sa_family == AF_INET) {
 		struct sockaddr_in *dst4 = (struct sockaddr_in *)dst;
 		struct sockaddr_in *mask4 = (struct sockaddr_in *)mask;
+		uint32_t scopeid = 0;
 		rt_get_inet_prefix_pmask(rt, &dst4->sin_addr, &mask4->sin_addr,
 		    &scopeid);
 		return;
@@ -813,8 +866,9 @@ export_rtaddrs(const struct rtentry *rt, struct sockaddr *dst,
 	if (dst->sa_family == AF_INET6) {
 		struct sockaddr_in6 *dst6 = (struct sockaddr_in6 *)dst;
 		struct sockaddr_in6 *mask6 = (struct sockaddr_in6 *)mask;
-		rt_get_inet6_prefix_pmask(rt, &dst6->sin6_addr, &mask6->sin6_addr,
-		    &scopeid);
+		uint32_t scopeid = 0;
+		rt_get_inet6_prefix_pmask(rt, &dst6->sin6_addr,
+		    &mask6->sin6_addr, &scopeid);
 		dst6->sin6_scope_id = scopeid;
 		return;
 	}
@@ -943,7 +997,6 @@ route_output(struct mbuf *m, struct socket *so, ...)
 #endif
 	int alloc_len = 0, len, error = 0, fibnum;
 	sa_family_t saf = AF_UNSPEC;
-	struct walkarg w;
 	struct rib_cmd_info rc;
 	struct nhop_object *nh;
 
@@ -971,7 +1024,6 @@ route_output(struct mbuf *m, struct socket *so, ...)
 
 	m_copydata(m, 0, len, (caddr_t)rtm);
 	bzero(&info, sizeof(info));
-	bzero(&w, sizeof(w));
 	nh = NULL;
 
 	if (rtm->rtm_version != RTM_VERSION) {
@@ -1001,6 +1053,18 @@ route_output(struct mbuf *m, struct socket *so, ...)
 			rti_need_deembed = 1;
 #endif
 		goto flush;
+	}
+
+	union sockaddr_union gw_saun;
+	int blackhole_flags = rtm->rtm_flags & (RTF_BLACKHOLE|RTF_REJECT);
+	if (blackhole_flags != 0) {
+		if (blackhole_flags != (RTF_BLACKHOLE | RTF_REJECT))
+			error = fill_blackholeinfo(&info, &gw_saun);
+		else
+			error = EINVAL;
+		if (error != 0)
+			senderr(error);
+		/* TODO: rebuild rtm from scratch */
 	}
 
 	switch (rtm->rtm_type) {
@@ -1229,6 +1293,233 @@ rt_xaddrs(caddr_t cp, caddr_t cplim, struct rt_addrinfo *rtinfo)
 	return (0);
 }
 
+#ifdef INET
+static inline void
+fill_sockaddr_inet(struct sockaddr_in *sin, struct in_addr addr)
+{
+
+	const struct sockaddr_in nsin = {
+		.sin_family = AF_INET,
+		.sin_len = sizeof(struct sockaddr_in),
+		.sin_addr = addr,
+	};
+	*sin = nsin;
+}
+#endif
+
+#ifdef INET6
+static inline void
+fill_sockaddr_inet6(struct sockaddr_in6 *sin6, const struct in6_addr *addr6,
+    uint32_t scopeid)
+{
+
+	const struct sockaddr_in6 nsin6 = {
+		.sin6_family = AF_INET6,
+		.sin6_len = sizeof(struct sockaddr_in6),
+		.sin6_addr = *addr6,
+		.sin6_scope_id = scopeid,
+	};
+	*sin6 = nsin6;
+}
+#endif
+
+/*
+ * Checks if gateway is suitable for lltable operations.
+ * Lltable code requires AF_LINK gateway with ifindex
+ *  and mac address specified.
+ * Returns 0 on success.
+ */
+static int
+cleanup_xaddrs_lladdr(struct rt_addrinfo *info)
+{
+	struct sockaddr_dl *sdl = (struct sockaddr_dl *)info->rti_info[RTAX_GATEWAY];
+
+	if (sdl->sdl_family != AF_LINK)
+		return (EINVAL);
+
+	if (sdl->sdl_index == 0)
+		return (EINVAL);
+
+	if (offsetof(struct sockaddr_dl, sdl_data) + sdl->sdl_nlen + sdl->sdl_alen > sdl->sdl_len)
+		return (EINVAL);
+
+	return (0);
+}
+
+static int
+cleanup_xaddrs_gateway(struct rt_addrinfo *info)
+{
+	struct sockaddr *gw = info->rti_info[RTAX_GATEWAY];
+
+	if (info->rti_flags & RTF_LLDATA)
+		return (cleanup_xaddrs_lladdr(info));
+
+	switch (gw->sa_family) {
+#ifdef INET
+	case AF_INET:
+		{
+			struct sockaddr_in *gw_sin = (struct sockaddr_in *)gw;
+			if (gw_sin->sin_len < sizeof(struct sockaddr_in)) {
+				printf("gw sin_len too small\n");
+				return (EINVAL);
+			}
+			fill_sockaddr_inet(gw_sin, gw_sin->sin_addr);
+		}
+		break;
+#endif
+#ifdef INET6
+	case AF_INET6:
+		{
+			struct sockaddr_in6 *gw_sin6 = (struct sockaddr_in6 *)gw;
+			if (gw_sin6->sin6_len < sizeof(struct sockaddr_in6)) {
+				printf("gw sin6_len too small\n");
+				return (EINVAL);
+			}
+			fill_sockaddr_inet6(gw_sin6, &gw_sin6->sin6_addr, 0);
+			break;
+		}
+#endif
+	case AF_LINK:
+		{
+			struct sockaddr_dl_short *gw_sdl;
+
+			gw_sdl = (struct sockaddr_dl_short *)gw;
+			if (gw_sdl->sdl_len < sizeof(struct sockaddr_dl_short)) {
+				printf("gw sdl_len too small\n");
+				return (EINVAL);
+			}
+
+			const struct sockaddr_dl_short sdl = {
+				.sdl_family = AF_LINK,
+				.sdl_len = sizeof(struct sockaddr_dl_short),
+				.sdl_index = gw_sdl->sdl_index,
+			};
+			*gw_sdl = sdl;
+			break;
+		}
+	}
+
+	return (0);
+}
+
+static void
+remove_netmask(struct rt_addrinfo *info)
+{
+	info->rti_info[RTAX_NETMASK] = NULL;
+	info->rti_flags |= RTF_HOST;
+	info->rti_addrs &= ~RTA_NETMASK;
+}
+
+#ifdef INET
+static int
+cleanup_xaddrs_inet(struct rt_addrinfo *info)
+{
+	struct sockaddr_in *dst_sa, *mask_sa;
+
+	/* Check & fixup dst/netmask combination first */
+	dst_sa = (struct sockaddr_in *)info->rti_info[RTAX_DST];
+	mask_sa = (struct sockaddr_in *)info->rti_info[RTAX_NETMASK];
+
+	struct in_addr mask = {
+		.s_addr = mask_sa ? mask_sa->sin_addr.s_addr : INADDR_BROADCAST,
+	};
+	struct in_addr dst = {
+		.s_addr = htonl(ntohl(dst_sa->sin_addr.s_addr) & ntohl(mask.s_addr))
+	};
+
+	if (dst_sa->sin_len < sizeof(struct sockaddr_in)) {
+		printf("dst sin_len too small\n");
+		return (EINVAL);
+	}
+	if (mask_sa && mask_sa->sin_len < sizeof(struct sockaddr_in)) {
+		printf("mask sin_len too small\n");
+		return (EINVAL);
+	}
+	fill_sockaddr_inet(dst_sa, dst);
+
+	if (mask.s_addr != INADDR_BROADCAST)
+		fill_sockaddr_inet(mask_sa, mask);
+	else
+		remove_netmask(info);
+
+	/* Check gateway */
+	if (info->rti_info[RTAX_GATEWAY] != NULL)
+		return (cleanup_xaddrs_gateway(info));
+
+	return (0);
+}
+#endif
+
+#ifdef INET6
+static int
+cleanup_xaddrs_inet6(struct rt_addrinfo *info)
+{
+	struct sockaddr_in6 *dst_sa, *mask_sa;
+	struct in6_addr mask;
+
+	/* Check & fixup dst/netmask combination first */
+	dst_sa = (struct sockaddr_in6 *)info->rti_info[RTAX_DST];
+	mask_sa = (struct sockaddr_in6 *)info->rti_info[RTAX_NETMASK];
+
+	mask = mask_sa ? mask_sa->sin6_addr : in6mask128;
+	IN6_MASK_ADDR(&dst_sa->sin6_addr, &mask);
+
+	if (dst_sa->sin6_len < sizeof(struct sockaddr_in6)) {
+		printf("dst sin6_len too small\n");
+		return (EINVAL);
+	}
+	if (mask_sa && mask_sa->sin6_len < sizeof(struct sockaddr_in6)) {
+		printf("mask sin6_len too small\n");
+		return (EINVAL);
+	}
+	fill_sockaddr_inet6(dst_sa, &dst_sa->sin6_addr, 0);
+
+	if (!IN6_ARE_ADDR_EQUAL(&mask, &in6mask128))
+		fill_sockaddr_inet6(mask_sa, &mask, 0);
+	else
+		remove_netmask(info);
+
+	/* Check gateway */
+	if (info->rti_info[RTAX_GATEWAY] != NULL)
+		return (cleanup_xaddrs_gateway(info));
+
+	return (0);
+}
+#endif
+
+static int
+cleanup_xaddrs(struct rt_addrinfo *info)
+{
+	int error = EAFNOSUPPORT;
+
+	if (info->rti_info[RTAX_DST] == NULL)
+		return (EINVAL);
+
+	if (info->rti_flags & RTF_LLDATA) {
+		/*
+		 * arp(8)/ndp(8) sends RTA_NETMASK for the associated
+		 * prefix along with the actual address in RTA_DST.
+		 * Remove netmask to avoid unnecessary address masking.
+		 */
+		remove_netmask(info);
+	}
+
+	switch (info->rti_info[RTAX_DST]->sa_family) {
+#ifdef INET
+	case AF_INET:
+		error = cleanup_xaddrs_inet(info);
+		break;
+#endif
+#ifdef INET6
+	case AF_INET6:
+		error = cleanup_xaddrs_inet6(info);
+		break;
+#endif
+	}
+
+	return (error);
+}
+
 /*
  * Fill in @dmask with valid netmask leaving original @smask
  * intact. Mostly used with radix netmasks.
@@ -1258,12 +1549,12 @@ rtsock_fix_netmask(const struct sockaddr *dst, const struct sockaddr *smask,
 static struct mbuf *
 rtsock_msg_mbuf(int type, struct rt_addrinfo *rtinfo)
 {
+	struct sockaddr_storage ss;
 	struct rt_msghdr *rtm;
 	struct mbuf *m;
 	int i;
 	struct sockaddr *sa;
 #ifdef INET6
-	struct sockaddr_storage ss;
 	struct sockaddr_in6 *sin6;
 #endif
 	int len, dlen;
@@ -1308,13 +1599,17 @@ rtsock_msg_mbuf(int type, struct rt_addrinfo *rtinfo)
 		if ((sa = rtinfo->rti_info[i]) == NULL)
 			continue;
 		rtinfo->rti_addrs |= (1 << i);
+
 		dlen = SA_SIZE(sa);
+		KASSERT(dlen <= sizeof(ss),
+		    ("%s: sockaddr size overflow", __func__));
+		bzero(&ss, sizeof(ss));
+		bcopy(sa, &ss, sa->sa_len);
+		sa = (struct sockaddr *)&ss;
 #ifdef INET6
 		if (sa->sa_family == AF_INET6) {
-			sin6 = (struct sockaddr_in6 *)&ss;
-			bcopy(sa, sin6, sizeof(*sin6));
-			if (sa6_recoverscope(sin6) == 0)
-				sa = (struct sockaddr *)sin6;
+			sin6 = (struct sockaddr_in6 *)sa;
+			(void)sa6_recoverscope(sin6);
 		}
 #endif
 		m_copyback(m, len, dlen, (caddr_t)sa);
@@ -1342,12 +1637,11 @@ rtsock_msg_mbuf(int type, struct rt_addrinfo *rtinfo)
 static int
 rtsock_msg_buffer(int type, struct rt_addrinfo *rtinfo, struct walkarg *w, int *plen)
 {
-	int i;
-	int len, buflen = 0, dlen;
+	struct sockaddr_storage ss;
+	int len, buflen = 0, dlen, i;
 	caddr_t cp = NULL;
 	struct rt_msghdr *rtm = NULL;
 #ifdef INET6
-	struct sockaddr_storage ss;
 	struct sockaddr_in6 *sin6;
 #endif
 #ifdef COMPAT_FREEBSD32
@@ -1414,12 +1708,15 @@ rtsock_msg_buffer(int type, struct rt_addrinfo *rtinfo, struct walkarg *w, int *
 #endif
 			dlen = SA_SIZE(sa);
 		if (cp != NULL && buflen >= dlen) {
+			KASSERT(dlen <= sizeof(ss),
+			    ("%s: sockaddr size overflow", __func__));
+			bzero(&ss, sizeof(ss));
+			bcopy(sa, &ss, sa->sa_len);
+			sa = (struct sockaddr *)&ss;
 #ifdef INET6
 			if (sa->sa_family == AF_INET6) {
-				sin6 = (struct sockaddr_in6 *)&ss;
-				bcopy(sa, sin6, sizeof(*sin6));
-				if (sa6_recoverscope(sin6) == 0)
-					sa = (struct sockaddr *)sin6;
+				sin6 = (struct sockaddr_in6 *)sa;
+				(void)sa6_recoverscope(sin6);
 			}
 #endif
 			bcopy((caddr_t)sa, cp, (unsigned)dlen);
@@ -1584,23 +1881,25 @@ rtsock_addrmsg(int cmd, struct ifaddr *ifa, int fibnum)
  * Returns 0 on success.
  */
 int
-rtsock_routemsg(int cmd, struct rtentry *rt, struct ifnet *ifp, int rti_addrs,
+rtsock_routemsg(int cmd, struct rtentry *rt, struct nhop_object *nh,
     int fibnum)
 {
-	struct sockaddr_storage ss;
+	union sockaddr_union dst, mask;
 	struct rt_addrinfo info;
-	struct nhop_object *nh;
 
 	if (V_route_cb.any_count == 0)
 		return (0);
 
-	nh = rt->rt_nhop;
+	int family = rt_get_family(rt);
+	init_sockaddrs_family(family, &dst.sa, &mask.sa);
+	export_rtaddrs(rt, &dst.sa, &mask.sa);
+
 	bzero((caddr_t)&info, sizeof(info));
-	info.rti_info[RTAX_DST] = rt_key(rt);
-	info.rti_info[RTAX_NETMASK] = rtsock_fix_netmask(rt_key(rt), rt_mask(rt), &ss);
+	info.rti_info[RTAX_DST] = &dst.sa;
+	info.rti_info[RTAX_NETMASK] = &mask.sa;
 	info.rti_info[RTAX_GATEWAY] = &nh->gw_sa;
 	info.rti_flags = rt->rte_flags | nhop_get_rtflags(nh);
-	info.rti_ifp = ifp;
+	info.rti_ifp = nh->nh_ifp;
 
 	return (rtsock_routemsg_info(cmd, &info, fibnum));
 }

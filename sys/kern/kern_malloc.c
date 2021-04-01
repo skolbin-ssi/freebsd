@@ -537,7 +537,7 @@ malloc_dbg(caddr_t *vap, size_t *sizep, struct malloc_type *mtp,
 #ifdef EPOCH_TRACE
 			epoch_trace_list(curthread);
 #endif
-			KASSERT(1, 
+			KASSERT(0,
 			    ("malloc(M_WAITOK) with sleeping prohibited"));
 		}
 	}
@@ -764,6 +764,37 @@ malloc_domainset_exec(size_t size, struct malloc_type *mtp, struct domainset *ds
 }
 
 void *
+malloc_domainset_aligned(size_t size, size_t align,
+    struct malloc_type *mtp, struct domainset *ds, int flags)
+{
+	void *res;
+	size_t asize;
+
+	KASSERT(align != 0 && powerof2(align),
+	    ("malloc_domainset_aligned: wrong align %#zx size %#zx",
+	    align, size));
+	KASSERT(align <= PAGE_SIZE,
+	    ("malloc_domainset_aligned: align %#zx (size %#zx) too large",
+	    align, size));
+
+	/*
+	 * Round the allocation size up to the next power of 2,
+	 * because we can only guarantee alignment for
+	 * power-of-2-sized allocations.  Further increase the
+	 * allocation size to align if the rounded size is less than
+	 * align, since malloc zones provide alignment equal to their
+	 * size.
+	 */
+	asize = size <= align ? align : 1UL << flsl(size - 1);
+
+	res = malloc_domainset(asize, mtp, ds, flags);
+	KASSERT(res == NULL || ((uintptr_t)res & (align - 1)) == 0,
+	    ("malloc_domainset_aligned: result not aligned %p size %#zx "
+	    "allocsize %#zx align %#zx", res, size, asize, align));
+	return (res);
+}
+
+void *
 mallocarray(size_t nmemb, size_t size, struct malloc_type *type, int flags)
 {
 
@@ -771,6 +802,17 @@ mallocarray(size_t nmemb, size_t size, struct malloc_type *type, int flags)
 		panic("mallocarray: %zu * %zu overflowed", nmemb, size);
 
 	return (malloc(size * nmemb, type, flags));
+}
+
+void *
+mallocarray_domainset(size_t nmemb, size_t size, struct malloc_type *type,
+    struct domainset *ds, int flags)
+{
+
+	if (WOULD_OVERFLOW(nmemb, size))
+		panic("mallocarray_domainset: %zu * %zu overflowed", nmemb, size);
+
+	return (malloc_domainset(size * nmemb, type, ds, flags));
 }
 
 #ifdef INVARIANTS
@@ -1146,8 +1188,12 @@ mallocinit(void *dummy)
 	for (i = 0, indx = 0; kmemzones[indx].kz_size != 0; indx++) {
 		int size = kmemzones[indx].kz_size;
 		const char *name = kmemzones[indx].kz_name;
+		size_t align;
 		int subzone;
 
+		align = UMA_ALIGN_PTR;
+		if (powerof2(size) && size > sizeof(void *))
+			align = MIN(size, PAGE_SIZE) - 1;
 		for (subzone = 0; subzone < numzones; subzone++) {
 			kmemzones[indx].kz_zone[subzone] =
 			    uma_zcreate(name, size,
@@ -1156,7 +1202,7 @@ mallocinit(void *dummy)
 #else
 			    NULL, NULL, NULL, NULL,
 #endif
-			    UMA_ALIGN_PTR, UMA_ZONE_MALLOC);
+			    align, UMA_ZONE_MALLOC);
 		}
 		for (;i <= size; i+= KMEM_ZBASE)
 			kmemsize[i >> KMEM_ZSHIFT] = indx;

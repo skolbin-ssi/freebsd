@@ -506,6 +506,8 @@ vm_fault_populate(struct faultstate *fs)
 		    PMAP_ENTER_LARGEPAGE, bdry_idx);
 		VM_OBJECT_WLOCK(fs->first_object);
 		vm_page_xunbusy(m);
+		if (rv != KERN_SUCCESS)
+			goto out;
 		if ((fs->fault_flags & VM_FAULT_WIRE) != 0) {
 			for (i = 0; i < atop(pagesizes[bdry_idx]); i++)
 				vm_page_wire(m + i);
@@ -540,17 +542,13 @@ vm_fault_populate(struct faultstate *fs)
 	    pidx <= pager_last;
 	    pidx += npages, m = vm_page_next(&m[npages - 1])) {
 		vaddr = fs->entry->start + IDX_TO_OFF(pidx) - fs->entry->offset;
-#if defined(__aarch64__) || defined(__amd64__) || (defined(__arm__) && \
-    __ARM_ARCH >= 6) || defined(__i386__) || defined(__riscv) || \
-    defined(__powerpc64__)
+
 		psind = m->psind;
 		if (psind > 0 && ((vaddr & (pagesizes[psind] - 1)) != 0 ||
 		    pidx + OFF_TO_IDX(pagesizes[psind]) - 1 > pager_last ||
 		    !pmap_ps_enabled(fs->map->pmap) || fs->wired))
 			psind = 0;
-#else
-		psind = 0;
-#endif		
+
 		npages = atop(pagesizes[psind]);
 		for (i = 0; i < npages; i++) {
 			vm_fault_populate_check_page(&m[i]);
@@ -559,8 +557,18 @@ vm_fault_populate(struct faultstate *fs)
 		VM_OBJECT_WUNLOCK(fs->first_object);
 		rv = pmap_enter(fs->map->pmap, vaddr, m, fs->prot, fs->fault_type |
 		    (fs->wired ? PMAP_ENTER_WIRED : 0), psind);
-#if defined(__amd64__)
-		if (psind > 0 && rv == KERN_FAILURE) {
+
+		/*
+		 * pmap_enter() may fail for a superpage mapping if additional
+		 * protection policies prevent the full mapping.
+		 * For example, this will happen on amd64 if the entire
+		 * address range does not share the same userspace protection
+		 * key.  Revert to single-page mappings if this happens.
+		 */
+		MPASS(rv == KERN_SUCCESS ||
+		    (psind > 0 && rv == KERN_PROTECTION_FAILURE));
+		if (__predict_false(psind > 0 &&
+		    rv == KERN_PROTECTION_FAILURE)) {
 			for (i = 0; i < npages; i++) {
 				rv = pmap_enter(fs->map->pmap, vaddr + ptoa(i),
 				    &m[i], fs->prot, fs->fault_type |
@@ -568,9 +576,7 @@ vm_fault_populate(struct faultstate *fs)
 				MPASS(rv == KERN_SUCCESS);
 			}
 		}
-#else
-		MPASS(rv == KERN_SUCCESS);
-#endif
+
 		VM_OBJECT_WLOCK(fs->first_object);
 		for (i = 0; i < npages; i++) {
 			if ((fs->fault_flags & VM_FAULT_WIRE) != 0)
@@ -586,7 +592,7 @@ vm_fault_populate(struct faultstate *fs)
 	}
 out:
 	curthread->td_ru.ru_majflt++;
-	return (KERN_SUCCESS);
+	return (rv);
 }
 
 static int prot_fault_translation;
@@ -1073,6 +1079,7 @@ vm_fault_allocate(struct faultstate *fs)
 		switch (rv) {
 		case KERN_SUCCESS:
 		case KERN_FAILURE:
+		case KERN_PROTECTION_FAILURE:
 		case KERN_RESTART:
 			return (rv);
 		case KERN_NOT_RECEIVER:
@@ -1343,6 +1350,7 @@ RetryFault:
 			goto RetryFault;
 		case KERN_SUCCESS:
 		case KERN_FAILURE:
+		case KERN_PROTECTION_FAILURE:
 		case KERN_OUT_OF_BOUNDS:
 			unlock_and_deallocate(&fs);
 			return (rv);
@@ -1410,6 +1418,7 @@ RetryFault:
 				goto RetryFault;
 			case KERN_SUCCESS:
 			case KERN_FAILURE:
+			case KERN_PROTECTION_FAILURE:
 			case KERN_OUT_OF_BOUNDS:
 				unlock_and_deallocate(&fs);
 				return (rv);
