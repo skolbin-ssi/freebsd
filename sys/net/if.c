@@ -37,6 +37,7 @@
 #include "opt_inet.h"
 
 #include <sys/param.h>
+#include <sys/capsicum.h>
 #include <sys/conf.h>
 #include <sys/eventhandler.h>
 #include <sys/malloc.h>

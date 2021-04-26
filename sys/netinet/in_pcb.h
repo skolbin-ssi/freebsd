@@ -763,7 +763,7 @@ int	inp_so_options(const struct inpcb *inp);
 #define	INPLOOKUP_WLOCKPCB	0x00000004	/* Return inpcb write-locked. */
 
 #define	INPLOOKUP_MASK	(INPLOOKUP_WILDCARD | INPLOOKUP_RLOCKPCB | \
-			    INPLOOKUP_WLOCKPCB)
+	    INPLOOKUP_WLOCKPCB)
 
 #define	sotoinpcb(so)	((struct inpcb *)(so)->so_pcb)
 

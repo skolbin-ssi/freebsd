@@ -1293,31 +1293,18 @@ in6_pcblookup_hash(struct inpcbinfo *pcbinfo, struct in6_addr *faddr,
 	struct inpcb *inp;
 
 	inp = in6_pcblookup_hash_locked(pcbinfo, faddr, fport, laddr, lport,
-	    (lookupflags & ~(INPLOOKUP_RLOCKPCB | INPLOOKUP_WLOCKPCB)), ifp,
-	    numa_domain);
+	    lookupflags & INPLOOKUP_WILDCARD, ifp, numa_domain);
 	if (inp != NULL) {
 		if (lookupflags & INPLOOKUP_WLOCKPCB) {
 			INP_WLOCK(inp);
-			if (__predict_false(inp->inp_flags2 & INP_FREED)) {
-				INP_WUNLOCK(inp);
-				inp = NULL;
-			}
 		} else if (lookupflags & INPLOOKUP_RLOCKPCB) {
 			INP_RLOCK(inp);
-			if (__predict_false(inp->inp_flags2 & INP_FREED)) {
-				INP_RUNLOCK(inp);
-				inp = NULL;
-			}
 		} else
 			panic("%s: locking bug", __func__);
-#ifdef INVARIANTS
-		if (inp != NULL) {
-			if (lookupflags & INPLOOKUP_WLOCKPCB)
-				INP_WLOCK_ASSERT(inp);
-			else
-				INP_RLOCK_ASSERT(inp);
+		if (__predict_false(inp->inp_flags2 & INP_FREED)) {
+			INP_UNLOCK(inp);
+			inp = NULL;
 		}
-#endif
 	}
 	return (inp);
 }

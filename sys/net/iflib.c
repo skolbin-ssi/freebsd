@@ -914,13 +914,16 @@ netmap_fl_refill(iflib_rxq_t rxq, struct netmap_kring *kring, bool init)
 		nic_i_first = nic_i;
 		for (i = 0; n > 0 && i < IFLIB_MAX_RX_REFRESH; n--, i++) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
-			void *addr = PNMB(na, slot, &fl->ifl_bus_addrs[i]);
+			uint64_t paddr;
+			void *addr = PNMB(na, slot, &paddr);
 
 			MPASS(i < IFLIB_MAX_RX_REFRESH);
 
 			if (addr == NETMAP_BUF_BASE(na)) /* bad buf */
 			        return netmap_ring_reinit(kring);
 
+			fl->ifl_bus_addrs[i] = paddr +
+			    nm_get_offset(kring, slot);
 			fl->ifl_rxd_idxs[i] = nic_i;
 
 			if (__predict_false(init)) {
@@ -1038,6 +1041,7 @@ iflib_netmap_txsync(struct netmap_kring *kring, int flags)
 
 		for (n = 0; nm_i != head; n++) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
+			uint64_t offset = nm_get_offset(kring, slot);
 			u_int len = slot->len;
 			uint64_t paddr;
 			void *addr = PNMB(na, slot, &paddr);
@@ -1053,7 +1057,7 @@ iflib_netmap_txsync(struct netmap_kring *kring, int flags)
 			if (nic_i_start < 0)
 				nic_i_start = nic_i;
 
-			pi.ipi_segs[seg_idx].ds_addr = paddr;
+			pi.ipi_segs[seg_idx].ds_addr = paddr + offset;
 			pi.ipi_segs[seg_idx].ds_len = len;
 			if (len) {
 				pkt_len += len;
@@ -1081,7 +1085,7 @@ iflib_netmap_txsync(struct netmap_kring *kring, int flags)
 			__builtin_prefetch(&txq->ift_sds.ifsd_m[nic_i + 1]);
 			__builtin_prefetch(&txq->ift_sds.ifsd_map[nic_i + 1]);
 
-			NM_CHECK_ADDR_LEN(na, addr, len);
+			NM_CHECK_ADDR_LEN_OFF(na, len, offset);
 
 			if (slot->flags & NS_BUF_CHANGED) {
 				/* buffer has changed, reload map */
@@ -1289,7 +1293,7 @@ iflib_netmap_attach(if_ctx_t ctx)
 	bzero(&na, sizeof(na));
 
 	na.ifp = ctx->ifc_ifp;
-	na.na_flags = NAF_BDG_MAYSLEEP | NAF_MOREFRAG;
+	na.na_flags = NAF_BDG_MAYSLEEP | NAF_MOREFRAG | NAF_OFFSETS;
 	MPASS(ctx->ifc_softc_ctx.isc_ntxqsets);
 	MPASS(ctx->ifc_softc_ctx.isc_nrxqsets);
 
@@ -5887,15 +5891,13 @@ iflib_rx_structures_setup(if_ctx_t ctx)
 
 	for (q = 0; q < ctx->ifc_softc_ctx.isc_nrxqsets; q++, rxq++) {
 #if defined(INET6) || defined(INET)
-		if (if_getcapabilities(ctx->ifc_ifp) & IFCAP_LRO) {
-			err = tcp_lro_init_args(&rxq->ifr_lc, ctx->ifc_ifp,
-			    TCP_LRO_ENTRIES, min(1024,
-			    ctx->ifc_softc_ctx.isc_nrxd[rxq->ifr_fl_offset]));
-			if (err != 0) {
-				device_printf(ctx->ifc_dev,
-				    "LRO Initialization failed!\n");
-				goto fail;
-			}
+		err = tcp_lro_init_args(&rxq->ifr_lc, ctx->ifc_ifp,
+		    TCP_LRO_ENTRIES, min(1024,
+		    ctx->ifc_softc_ctx.isc_nrxd[rxq->ifr_fl_offset]));
+		if (err != 0) {
+			device_printf(ctx->ifc_dev,
+			    "LRO Initialization failed!\n");
+			goto fail;
 		}
 #endif
 		IFDI_RXQ_SETUP(ctx, rxq->ifr_id);
@@ -5910,8 +5912,7 @@ fail:
 	 */
 	rxq = ctx->ifc_rxqs;
 	for (i = 0; i < q; ++i, rxq++) {
-		if (if_getcapabilities(ctx->ifc_ifp) & IFCAP_LRO)
-			tcp_lro_free(&rxq->ifr_lc);
+		tcp_lro_free(&rxq->ifr_lc);
 	}
 	return (err);
 #endif
@@ -5934,8 +5935,7 @@ iflib_rx_structures_free(if_ctx_t ctx)
 			iflib_dma_free(&rxq->ifr_ifdi[j]);
 		iflib_rx_sds_free(rxq);
 #if defined(INET6) || defined(INET)
-		if (if_getcapabilities(ctx->ifc_ifp) & IFCAP_LRO)
-			tcp_lro_free(&rxq->ifr_lc);
+		tcp_lro_free(&rxq->ifr_lc);
 #endif
 	}
 	free(ctx->ifc_rxqs, M_IFLIB);

@@ -32,6 +32,7 @@ options 	INET			# InterNETworking
 options 	INET6			# IPv6 communications protocols
 options 	IPSEC_SUPPORT		# Allow kldload of ipsec and tcpmd5
 options		ROUTE_MPATH		# Multipath routing support
+options		FIB_ALGO		# Modular fib lookups
 options 	TCP_OFFLOAD		# TCP offload
 options 	TCP_HHOOK		# hhook(9) framework for TCP
 options		TCP_RFC7413		# TCP Fast Open
@@ -182,7 +183,6 @@ device		gpio
 device		gpioled
 device		fdt_pinctrl
 device		gpioregulator
-device		ls1046_gpio	# LS1046A GPIO controller
 device		mv_gpio		# Marvell GPIO controller
 device		mvebu_pinctrl	# Marvell Pinmux Controller
 device		pl061		# Arm PL061 GPIO controller

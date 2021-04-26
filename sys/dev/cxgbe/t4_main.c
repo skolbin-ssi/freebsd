@@ -593,7 +593,7 @@ SYSCTL_INT(_hw_cxgbe, OID_AUTO, pcie_relaxed_ordering, CTLFLAG_RDTUN,
     "PCIe Relaxed Ordering: 0 = disable, 1 = enable, 2 = leave alone");
 
 static int t4_panic_on_fatal_err = 0;
-SYSCTL_INT(_hw_cxgbe, OID_AUTO, panic_on_fatal_err, CTLFLAG_RDTUN,
+SYSCTL_INT(_hw_cxgbe, OID_AUTO, panic_on_fatal_err, CTLFLAG_RWTUN,
     &t4_panic_on_fatal_err, 0, "panic on fatal errors");
 
 static int t4_tx_vm_wr = 0;
@@ -735,9 +735,10 @@ static int t4_free_irq(struct adapter *, struct irq *);
 static void t4_init_atid_table(struct adapter *);
 static void t4_free_atid_table(struct adapter *);
 static void get_regs(struct adapter *, struct t4_regdump *, uint8_t *);
-static void vi_refresh_stats(struct adapter *, struct vi_info *);
-static void cxgbe_refresh_stats(struct adapter *, struct port_info *);
+static void vi_refresh_stats(struct vi_info *);
+static void cxgbe_refresh_stats(struct vi_info *);
 static void cxgbe_tick(void *);
+static void vi_tick(void *);
 static void cxgbe_sysctls(struct port_info *);
 static int sysctl_int_array(SYSCTL_HANDLER_ARGS);
 static int sysctl_bitfield_8b(SYSCTL_HANDLER_ARGS);
@@ -820,6 +821,9 @@ static int ktls_capability(struct adapter *, bool);
 #endif
 static int mod_event(module_t, int, void *);
 static int notify_siblings(device_t, int);
+static uint64_t vi_get_counter(struct ifnet *, ift_counter);
+static uint64_t cxgbe_get_counter(struct ifnet *, ift_counter);
+static void enable_vxlan_rx(struct adapter *);
 
 struct {
 	uint16_t device;
@@ -1797,7 +1801,8 @@ cxgbe_vi_attach(device_t dev, struct vi_info *vi)
 	struct adapter *sc = vi->adapter;
 
 	vi->xact_addr_filt = -1;
-	callout_init(&vi->tick, 1);
+	mtx_init(&vi->tick_mtx, "vi tick", NULL, MTX_DEF);
+	callout_init_mtx(&vi->tick, &vi->tick_mtx, 0);
 	if (sc->flags & IS_VF || t4_tx_vm_wr != 0)
 		vi->flags |= TX_USES_VM_WR;
 
@@ -1817,7 +1822,10 @@ cxgbe_vi_attach(device_t dev, struct vi_info *vi)
 	ifp->if_ioctl = cxgbe_ioctl;
 	ifp->if_transmit = cxgbe_transmit;
 	ifp->if_qflush = cxgbe_qflush;
-	ifp->if_get_counter = cxgbe_get_counter;
+	if (vi->pi->nvi > 1 || sc->flags & IS_VF)
+		ifp->if_get_counter = vi_get_counter;
+	else
+		ifp->if_get_counter = cxgbe_get_counter;
 #if defined(KERN_TLS) || defined(RATELIMIT)
 	ifp->if_snd_tag_alloc = cxgbe_snd_tag_alloc;
 	ifp->if_snd_tag_modify = cxgbe_snd_tag_modify;
@@ -1921,8 +1929,6 @@ cxgbe_attach(device_t dev)
 	struct vi_info *vi;
 	int i, rc;
 
-	callout_init_mtx(&pi->tick, &pi->pi_lock, 0);
-
 	rc = cxgbe_vi_attach(dev, &pi->vi[0]);
 	if (rc)
 		return (rc);
@@ -1991,7 +1997,6 @@ cxgbe_detach(device_t dev)
 	}
 
 	cxgbe_vi_detach(&pi->vi[0]);
-	callout_drain(&pi->tick);
 	ifmedia_removeall(&pi->media);
 
 	end_synchronized_op(sc, 0);
@@ -2338,7 +2343,9 @@ vi_get_counter(struct ifnet *ifp, ift_counter c)
 	struct vi_info *vi = ifp->if_softc;
 	struct fw_vi_stats_vf *s = &vi->stats;
 
-	vi_refresh_stats(vi->adapter, vi);
+	mtx_lock(&vi->tick_mtx);
+	vi_refresh_stats(vi);
+	mtx_unlock(&vi->tick_mtx);
 
 	switch (c) {
 	case IFCOUNTER_IPACKETS:
@@ -2382,18 +2389,16 @@ vi_get_counter(struct ifnet *ifp, ift_counter c)
 	}
 }
 
-uint64_t
+static uint64_t
 cxgbe_get_counter(struct ifnet *ifp, ift_counter c)
 {
 	struct vi_info *vi = ifp->if_softc;
 	struct port_info *pi = vi->pi;
-	struct adapter *sc = pi->adapter;
 	struct port_stats *s = &pi->stats;
 
-	if (pi->nvi > 1 || sc->flags & IS_VF)
-		return (vi_get_counter(ifp, c));
-
-	cxgbe_refresh_stats(sc, pi);
+	mtx_lock(&vi->tick_mtx);
+	cxgbe_refresh_stats(vi);
+	mtx_unlock(&vi->tick_mtx);
 
 	switch (c) {
 	case IFCOUNTER_IPACKETS:
@@ -5583,14 +5588,16 @@ cxgbe_init_synchronized(struct vi_info *vi)
 	/* all ok */
 	pi->up_vis++;
 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
-
-	if (pi->nvi > 1 || sc->flags & IS_VF)
-		callout_reset(&vi->tick, hz, vi_tick, vi);
-	else
-		callout_reset(&pi->tick, hz, cxgbe_tick, pi);
 	if (pi->link_cfg.link_ok)
 		t4_os_link_changed(pi);
 	PORT_UNLOCK(pi);
+
+	mtx_lock(&vi->tick_mtx);
+	if (ifp->if_get_counter == vi_get_counter)
+		callout_reset(&vi->tick, hz, vi_tick, vi);
+	else
+		callout_reset(&vi->tick, hz, cxgbe_tick, vi);
+	mtx_unlock(&vi->tick_mtx);
 done:
 	if (rc != 0)
 		cxgbe_uninit_synchronized(vi);
@@ -5642,11 +5649,11 @@ cxgbe_uninit_synchronized(struct vi_info *vi)
 		TXQ_UNLOCK(txq);
 	}
 
+	mtx_lock(&vi->tick_mtx);
+	callout_stop(&vi->tick);
+	mtx_unlock(&vi->tick_mtx);
+
 	PORT_LOCK(pi);
-	if (pi->nvi > 1 || sc->flags & IS_VF)
-		callout_stop(&vi->tick);
-	else
-		callout_stop(&pi->tick);
 	if (!(ifp->if_drv_flags & IFF_DRV_RUNNING)) {
 		PORT_UNLOCK(pi);
 		return (0);
@@ -6277,11 +6284,11 @@ read_vf_stat(struct adapter *sc, u_int vin, int reg)
 {
 	u32 stats[2];
 
-	mtx_assert(&sc->reg_lock, MA_OWNED);
 	if (sc->flags & IS_VF) {
 		stats[0] = t4_read_reg(sc, VF_MPS_REG(reg));
 		stats[1] = t4_read_reg(sc, VF_MPS_REG(reg + 4));
 	} else {
+		mtx_assert(&sc->reg_lock, MA_OWNED);
 		t4_write_reg(sc, A_PL_INDIR_CMD, V_PL_AUTOINC(1) |
 		    V_PL_VFID(vin) | V_PL_ADDR(VF_MPS_REG(reg)));
 		stats[0] = t4_read_reg(sc, A_PL_INDIR_DATA);
@@ -6297,6 +6304,8 @@ t4_get_vi_stats(struct adapter *sc, u_int vin, struct fw_vi_stats_vf *stats)
 #define GET_STAT(name) \
 	read_vf_stat(sc, vin, A_MPS_VF_STAT_##name##_L)
 
+	if (!(sc->flags & IS_VF))
+		mtx_lock(&sc->reg_lock);
 	stats->tx_bcast_bytes    = GET_STAT(TX_VF_BCAST_BYTES);
 	stats->tx_bcast_frames   = GET_STAT(TX_VF_BCAST_FRAMES);
 	stats->tx_mcast_bytes    = GET_STAT(TX_VF_MCAST_BYTES);
@@ -6313,6 +6322,8 @@ t4_get_vi_stats(struct adapter *sc, u_int vin, struct fw_vi_stats_vf *stats)
 	stats->rx_ucast_bytes    = GET_STAT(RX_VF_UCAST_BYTES);
 	stats->rx_ucast_frames   = GET_STAT(RX_VF_UCAST_FRAMES);
 	stats->rx_err_frames     = GET_STAT(RX_VF_ERR_FRAMES);
+	if (!(sc->flags & IS_VF))
+		mtx_unlock(&sc->reg_lock);
 
 #undef GET_STAT
 }
@@ -6330,12 +6341,14 @@ t4_clr_vi_stats(struct adapter *sc, u_int vin)
 }
 
 static void
-vi_refresh_stats(struct adapter *sc, struct vi_info *vi)
+vi_refresh_stats(struct vi_info *vi)
 {
 	struct timeval tv;
 	const struct timeval interval = {0, 250000};	/* 250ms */
 
-	if (!(vi->flags & VI_INIT_DONE))
+	mtx_assert(&vi->tick_mtx, MA_OWNED);
+
+	if (!(vi->flags & VI_INIT_DONE) || vi->flags & VI_SKIP_STATS)
 		return;
 
 	getmicrotime(&tv);
@@ -6343,24 +6356,31 @@ vi_refresh_stats(struct adapter *sc, struct vi_info *vi)
 	if (timevalcmp(&tv, &vi->last_refreshed, <))
 		return;
 
-	mtx_lock(&sc->reg_lock);
-	t4_get_vi_stats(sc, vi->vin, &vi->stats);
+	t4_get_vi_stats(vi->adapter, vi->vin, &vi->stats);
 	getmicrotime(&vi->last_refreshed);
-	mtx_unlock(&sc->reg_lock);
 }
 
 static void
-cxgbe_refresh_stats(struct adapter *sc, struct port_info *pi)
+cxgbe_refresh_stats(struct vi_info *vi)
 {
 	u_int i, v, tnl_cong_drops, chan_map;
 	struct timeval tv;
 	const struct timeval interval = {0, 250000};	/* 250ms */
+	struct port_info *pi;
+	struct adapter *sc;
+
+	mtx_assert(&vi->tick_mtx, MA_OWNED);
+
+	if (vi->flags & VI_SKIP_STATS)
+		return;
 
 	getmicrotime(&tv);
 	timevalsub(&tv, &interval);
-	if (timevalcmp(&tv, &pi->last_refreshed, <))
+	if (timevalcmp(&tv, &vi->last_refreshed, <))
 		return;
 
+	pi = vi->pi;
+	sc = vi->adapter;
 	tnl_cong_drops = 0;
 	t4_get_port_stats(sc, pi->tx_chan, &pi->stats);
 	chan_map = pi->rx_e_chan_map;
@@ -6374,29 +6394,29 @@ cxgbe_refresh_stats(struct adapter *sc, struct port_info *pi)
 		chan_map &= ~(1 << i);
 	}
 	pi->tnl_cong_drops = tnl_cong_drops;
-	getmicrotime(&pi->last_refreshed);
+	getmicrotime(&vi->last_refreshed);
 }
 
 static void
 cxgbe_tick(void *arg)
 {
-	struct port_info *pi = arg;
-	struct adapter *sc = pi->adapter;
+	struct vi_info *vi = arg;
 
-	PORT_LOCK_ASSERT_OWNED(pi);
-	cxgbe_refresh_stats(sc, pi);
+	MPASS(IS_MAIN_VI(vi));
+	mtx_assert(&vi->tick_mtx, MA_OWNED);
 
-	callout_schedule(&pi->tick, hz);
+	cxgbe_refresh_stats(vi);
+	callout_schedule(&vi->tick, hz);
 }
 
-void
+static void
 vi_tick(void *arg)
 {
 	struct vi_info *vi = arg;
-	struct adapter *sc = vi->adapter;
 
-	vi_refresh_stats(sc, vi);
+	mtx_assert(&vi->tick_mtx, MA_OWNED);
 
+	vi_refresh_stats(vi);
 	callout_schedule(&vi->tick, hz);
 }
 
@@ -6839,6 +6859,12 @@ t4_sysctls(struct adapter *sc)
 		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "autorcvbuf_inc",
 		    CTLFLAG_RW, &sc->tt.autorcvbuf_inc, 0,
 		    "autorcvbuf increment");
+
+		sc->tt.update_hc_on_pmtu_change = 1;
+		SYSCTL_ADD_INT(ctx, children, OID_AUTO,
+		    "update_hc_on_pmtu_change", CTLFLAG_RW,
+		    &sc->tt.update_hc_on_pmtu_change, 0,
+		    "Update hostcache entry if the PMTU changes");
 
 		SYSCTL_ADD_PROC(ctx, children, OID_AUTO, "timer_tick",
 		    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
@@ -9137,7 +9163,7 @@ sysctl_mps_tcam_t6(SYSCTL_HANDLER_ARGS)
 		if (lookup_type && lookup_type != M_DATALKPTYPE) {
 			sbuf_printf(sb, "\n%3u %02x:%02x:%02x:%02x:%02x:%02x "
 			    "%012jx %06x %06x    -    -   %3c"
-			    "      'I'  %4x   %3c   %#x%4u%4d", i, addr[0],
+			    "        I  %4x   %3c   %#x%4u%4d", i, addr[0],
 			    addr[1], addr[2], addr[3], addr[4], addr[5],
 			    (uintmax_t)mask, vniy, vnix, dip_hit ? 'Y' : 'N',
 			    port_num, cls_lo & F_T6_SRAM_VLD ? 'Y' : 'N',
@@ -10752,6 +10778,8 @@ clear_stats(struct adapter *sc, u_int port_id)
 			for_each_ofld_txq(vi, i, ofld_txq) {
 				ofld_txq->wrq.tx_wrs_direct = 0;
 				ofld_txq->wrq.tx_wrs_copied = 0;
+				counter_u64_zero(ofld_txq->tx_iscsi_pdus);
+				counter_u64_zero(ofld_txq->tx_iscsi_octets);
 				counter_u64_zero(ofld_txq->tx_toe_tls_records);
 				counter_u64_zero(ofld_txq->tx_toe_tls_octets);
 			}
@@ -11644,12 +11672,38 @@ struct vxlan_evargs {
 };
 
 static void
+enable_vxlan_rx(struct adapter *sc)
+{
+	int i, rc;
+	struct port_info *pi;
+	uint8_t match_all_mac[ETHER_ADDR_LEN] = {0};
+
+	ASSERT_SYNCHRONIZED_OP(sc);
+
+	t4_write_reg(sc, A_MPS_RX_VXLAN_TYPE, V_VXLAN(sc->vxlan_port) |
+	    F_VXLAN_EN);
+	for_each_port(sc, i) {
+		pi = sc->port[i];
+		if (pi->vxlan_tcam_entry == true)
+			continue;
+		rc = t4_alloc_raw_mac_filt(sc, pi->vi[0].viid, match_all_mac,
+		    match_all_mac, sc->rawf_base + pi->port_id, 1, pi->port_id,
+		    true);
+		if (rc < 0) {
+			rc = -rc;
+			CH_ERR(&pi->vi[0],
+			    "failed to add VXLAN TCAM entry: %d.\n", rc);
+		} else {
+			MPASS(rc == sc->rawf_base + pi->port_id);
+			pi->vxlan_tcam_entry = true;
+		}
+	}
+}
+
+static void
 t4_vxlan_start(struct adapter *sc, void *arg)
 {
 	struct vxlan_evargs *v = arg;
-	struct port_info *pi;
-	uint8_t match_all_mac[ETHER_ADDR_LEN] = {0};
-	int i, rc;
 
 	if (sc->nrawf == 0 || chip_id(sc) <= CHELSIO_T5)
 		return;
@@ -11659,32 +11713,13 @@ t4_vxlan_start(struct adapter *sc, void *arg)
 	if (sc->vxlan_refcount == 0) {
 		sc->vxlan_port = v->port;
 		sc->vxlan_refcount = 1;
-		t4_write_reg(sc, A_MPS_RX_VXLAN_TYPE,
-		    V_VXLAN(v->port) | F_VXLAN_EN);
-		for_each_port(sc, i) {
-			pi = sc->port[i];
-			if (pi->vxlan_tcam_entry == true)
-				continue;
-			rc = t4_alloc_raw_mac_filt(sc, pi->vi[0].viid,
-			    match_all_mac, match_all_mac,
-			    sc->rawf_base + pi->port_id, 1, pi->port_id, true);
-			if (rc < 0) {
-				rc = -rc;
-				log(LOG_ERR,
-				    "%s: failed to add VXLAN TCAM entry: %d.\n",
-				    device_get_name(pi->vi[0].dev), rc);
-			} else {
-				MPASS(rc == sc->rawf_base + pi->port_id);
-				rc = 0;
-				pi->vxlan_tcam_entry = true;
-			}
-		}
+		enable_vxlan_rx(sc);
 	} else if (sc->vxlan_port == v->port) {
 		sc->vxlan_refcount++;
 	} else {
-		log(LOG_ERR, "%s: VXLAN already configured on port  %d; "
+		CH_ERR(sc, "VXLAN already configured on port  %d; "
 		    "ignoring attempt to configure it on port %d\n",
-		    device_get_nameunit(sc->dev), sc->vxlan_port, v->port);
+		    sc->vxlan_port, v->port);
 	}
 	end_synchronized_op(sc, 0);
 }

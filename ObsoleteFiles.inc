@@ -11,6 +11,10 @@
 # In case of a complete directory hierarchy the sorting is in depth first
 # order.
 #
+# Files that are installed or removed depending on some build option
+# are to be listed in /usr/src/tools/build/mk/OptionalObsoleteFiles.inc
+# instead of in this file.
+#
 # Before you commit changes to this file please check if any entries in
 # tools/build/mk/OptionalObsoleteFiles.inc can be removed. The following
 # command tells which files are listed more than once regardless of some
@@ -35,6 +39,29 @@
 #   -V OLD_FILES -V OLD_LIBS -V OLD_DIRS check-old | \
 #   xargs -n1 | sort | uniq -d;
 # done
+
+# 20210413: Remove pfctlinput2
+OLD_FILES+=usr/share/man/man9/pfctlinput2.9.gz
+
+# 20210412: Remove kernel asymmetric crypto
+OLD_FILES+=usr/share/man/man9/crypto_asym.9.gz
+OLD_FILES+=usr/share/man/man9/crypto_kdispatch.9.gz
+OLD_FILES+=usr/share/man/man9/crypto_kdone.9.gz
+OLD_FILES+=usr/share/man/man9/crypto_kregister.9.gz
+OLD_FILES+=usr/share/man/man9/CRYPTODEV_KPROCESS.9.gz
+
+# 20210410: remove unused libexec/rc.d/archdep
+OLD_FILES+=etc/rc.d/archdep
+
+# 20210408: remove tcp_hostcache.h
+OLD_FILES+=usr/include/netinet/tcp_hostcache.h
+
+# 20210403: remove kgmon(8)
+OLD_FILES+=usr/sbin/kgmon
+OLD_FILES+=usr/share/man/man8/kgmon.8.gz
+
+# 20210401: remove bt(4) man page
+OLD_FILES+=usr/share/man/man4/bt.4.gz
 
 # 20210322: retire mn(4) sync serial driver
 OLD_FILES+=usr/share/man/man4/if_mn.4.gz

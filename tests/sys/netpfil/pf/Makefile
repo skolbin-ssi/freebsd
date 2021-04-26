@@ -12,12 +12,15 @@ ATF_TESTS_SH+=	altq \
 		forward \
 		fragmentation \
 		icmp \
+		killstate \
+		map_e \
 		names \
 		nat \
 		pass_block \
 		pfsync	\
 		rdr \
 		route_to \
+		rules_counter \
 		set_skip \
 		set_tos \
 		src_track \
