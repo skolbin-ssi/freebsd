@@ -156,6 +156,17 @@ SYSCTL_INT(_net_inet_tcp_sack, OID_AUTO, globalholes, CTLFLAG_VNET | CTLFLAG_RD,
     &VNET_NAME(tcp_sack_globalholes), 0,
     "Global number of TCP SACK holes currently allocated");
 
+int
+tcp_dsack_block_exists(struct tcpcb *tp)
+{
+	/* Return true if a DSACK block exists */
+	if (tp->rcv_numsacks == 0)
+		return (0);
+	if (SEQ_LEQ(tp->sackblks[0].end, tp->rcv_nxt))
+		return(1);
+	return (0);
+}
+
 /*
  * This function will find overlaps with the currently stored sackblocks
  * and add any overlap as a dsack block upfront
@@ -872,9 +883,11 @@ tcp_sack_partialack(struct tcpcb *tp, struct tcphdr *th)
 		tcp_seq highdata = tp->snd_max;
 		if (tp->t_flags & TF_SENTFIN)
 			highdata--;
-		if (th->th_ack != highdata)
+		if (th->th_ack != highdata) {
+			tp->snd_fack = th->th_ack;
 			(void)tcp_sackhole_insert(tp, SEQ_MAX(th->th_ack,
 			    highdata - maxseg), highdata, NULL);
+		}
 	}
 	(void) tp->t_fb->tfb_tcp_output(tp);
 }

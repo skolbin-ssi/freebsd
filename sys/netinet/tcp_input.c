@@ -506,6 +506,7 @@ cc_post_recovery(struct tcpcb *tp, struct tcphdr *th)
 	}
 	/* XXXLAS: EXIT_RECOVERY ? */
 	tp->t_bytes_acked = 0;
+	tp->sackhint.delivered_data = 0;
 	tp->sackhint.prr_out = 0;
 }
 
@@ -525,7 +526,7 @@ cc_post_recovery(struct tcpcb *tp, struct tcphdr *th)
 	    (V_tcp_delack_enabled || (tp->t_flags & TF_NEEDSYN)))
 
 void inline
-cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
+cc_ecnpkt_handler_flags(struct tcpcb *tp, uint16_t flags, uint8_t iptos)
 {
 	INP_WLOCK_ASSERT(tp->t_inpcb);
 
@@ -543,7 +544,7 @@ cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
 			break;
 		}
 
-		if (th->th_flags & TH_CWR)
+		if (flags & TH_CWR)
 			tp->ccv->flags |= CCF_TCPHDR_CWR;
 		else
 			tp->ccv->flags &= ~CCF_TCPHDR_CWR;
@@ -555,6 +556,12 @@ cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
 			tp->t_flags |= TF_ACKNOW;
 		}
 	}
+}
+
+void inline
+cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
+{
+	cc_ecnpkt_handler_flags(tp, th->th_flags, iptos);
 }
 
 /*

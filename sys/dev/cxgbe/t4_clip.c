@@ -171,7 +171,7 @@ update_clip(struct adapter *sc, void *arg __unused)
 	if (begin_synchronized_op(sc, NULL, HOLD_LOCK, "t4clip"))
 		return;
 
-	if (mtx_initialized(&sc->clip_table_lock))
+	if (mtx_initialized(&sc->clip_table_lock) && !hw_off_limits(sc))
 		update_clip_table(sc);
 
 	end_synchronized_op(sc, LOCK_HELD);
@@ -343,8 +343,12 @@ t4_destroy_clip_table(struct adapter *sc)
 }
 
 static void
-t4_tom_ifaddr_event(void *arg __unused, struct ifnet *ifp)
+t4_ifaddr_event(void *arg __unused, struct ifnet *ifp, struct ifaddr *ifa,
+    int event)
 {
+
+	if (ifa->ifa_addr->sa_family != AF_INET6)
+		return;
 
 	atomic_add_rel_int(&in6_ifaddr_gen, 1);
 	taskqueue_enqueue_timeout(taskqueue_thread, &clip_task, -hz / 4);
@@ -390,15 +394,15 @@ t4_clip_modload(void)
 {
 
 	TIMEOUT_TASK_INIT(taskqueue_thread, &clip_task, 0, t4_clip_task, NULL);
-	ifaddr_evhandler = EVENTHANDLER_REGISTER(ifaddr_event,
-	    t4_tom_ifaddr_event, NULL, EVENTHANDLER_PRI_ANY);
+	ifaddr_evhandler = EVENTHANDLER_REGISTER(ifaddr_event_ext,
+	    t4_ifaddr_event, NULL, EVENTHANDLER_PRI_ANY);
 }
 
 void
 t4_clip_modunload(void)
 {
 
-	EVENTHANDLER_DEREGISTER(ifaddr_event, ifaddr_evhandler);
+	EVENTHANDLER_DEREGISTER(ifaddr_event_ext, ifaddr_evhandler);
 	taskqueue_cancel_timeout(taskqueue_thread, &clip_task, NULL);
 }
 #endif
