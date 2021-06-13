@@ -1343,8 +1343,8 @@
 	}
 240	AUE_NULL	STD {
 		int linux_sys_futex(
-		    void *uaddr,
-		    int op,
+		    uint32_t *uaddr,
+		    l_int op,
 		    uint32_t val,
 		    struct l_timespec *timeout,
 		    uint32_t *uaddr2,
@@ -2408,10 +2408,23 @@
 		);
 	}
 413	AUE_NULL	STD {
-		int linux_pselect6_time64(void);
+		int linux_pselect6_time64(
+		    l_int nfds,
+		    l_fd_set *readfds,
+		    l_fd_set *writefds,
+		    l_fd_set *exceptfds,
+		    struct l_timespec64 *tsp,
+		    l_uintptr_t *sig
+		);
 	}
 414	AUE_NULL	STD {
-		int linux_ppoll_time64(void);
+		int linux_ppoll_time64(
+		    struct pollfd *fds,
+		    uint32_t nfds,
+		    struct l_timespec64 *tsp,
+		    l_sigset_t *sset,
+		    l_size_t ssize
+		);
 	}
 415	AUE_NULL	UNIMPL	nosys
 416	AUE_NULL	STD {
@@ -2430,10 +2443,22 @@
 		int linux_semtimedop_time64(void);
 	}
 421	AUE_NULL	STD {
-		int linux_rt_sigtimedwait_time64(void);
+		int linux_rt_sigtimedwait_time64(
+		    l_sigset_t *mask,
+		    l_siginfo_t *ptr,
+		    struct l_timespec64 *timeout,
+		    l_size_t sigsetsize
+		);
 	}
 422	AUE_NULL	STD {
-		int linux_futex_time64(void);
+		int linux_sys_futex_time64(
+		    uint32_t *uaddr,
+		    l_int op,
+		    uint32_t val,
+		    struct l_timespec64 *timeout,
+		    uint32_t *uaddr2,
+		    uint32_t val3
+		);
 	}
 423	AUE_NULL	STD {
 		int linux_sched_rr_get_interval_time64(void);
